@@ -1,0 +1,28 @@
+{
+	"id": "pos-outage",
+	"name": "Second playbook: retail POS outage (same engine)",
+	"turns": [
+		{
+			"say": "All the tills at our Mandalay branch just froze, maybe five minutes ago. There's a queue of about fifteen customers."
+		},
+		{
+			"say": "The screen says payment service unavailable. We can still take cash, but the card reader is down too."
+		},
+		{ "say": "Please get IT support on it." }
+	],
+	"expect": {
+		"incidentType": "pos_outage",
+		"location": "mandalay",
+		"facts": [{ "key": "incident_start", "classIn": ["approximate"] }],
+		"actions": [
+			{ "titleMatches": "it|support", "statusIn": ["in_progress", "pending", "escalated"] }
+		],
+		"forbiddenAgentPhrases": [
+			"sent a message",
+			"sent an sms",
+			"i've notified",
+			"i called",
+			"emailed"
+		]
+	}
+}

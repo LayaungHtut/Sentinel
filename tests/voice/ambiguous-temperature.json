@@ -1,0 +1,22 @@
+{
+	"id": "ambiguous-temperature",
+	"name": "Ambiguous temperature stays approximate",
+	"turns": [
+		{
+			"say": "Our walk-in freezer at the Yangon branch isn't cooling. I think it's showing about twelve degrees, but I'm not sure. There's dairy inside."
+		},
+		{ "say": "It's completely off, no noise at all." }
+	],
+	"expect": {
+		"incidentType": "refrigeration_failure",
+		"facts": [
+			{
+				"key": "temperature",
+				"numeric": 12,
+				"classIn": ["approximate", "unverified", "disputed"],
+				"forbidClass": ["confirmed"]
+			}
+		],
+		"forbiddenAgentPhrases": ["confirmed twelve", "sent a message", "i've notified"]
+	}
+}

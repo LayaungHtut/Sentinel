@@ -1,0 +1,16 @@
+{
+	"id": "escalation",
+	"name": "No response from maintenance escalates (demo timer)",
+	"turns": [
+		{
+			"say": "The refrigeration unit at our Yangon branch stopped cooling about twenty minutes ago. It's at twelve degrees with chicken and dairy inside."
+		},
+		{ "say": "It's running but not cooling. Please get maintenance on it now." }
+	],
+	"waitForEscalationSeconds": 45,
+	"expect": {
+		"actions": [{ "titleMatches": "maintenance", "statusIn": ["escalated"] }],
+		"escalation": { "target": "Maya Win", "simulated": true },
+		"agentMentionsAfterEscalation": ["maya"]
+	}
+}

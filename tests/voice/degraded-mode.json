@@ -1,0 +1,6 @@
+{
+	"id": "degraded-mode",
+	"name": "Degraded mode: manual operation without voice",
+	"manual": true,
+	"note": "Executed by the automated e2e suite (scripts/e2e-inprocess.mjs): manual create, facts, actions, transitions, report with voice unavailable."
+}

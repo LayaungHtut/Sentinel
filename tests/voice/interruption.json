@@ -1,0 +1,28 @@
+{
+	"id": "interruption",
+	"name": "Barge-in: user interrupts with new information",
+	"turns": [
+		{
+			"say": "The refrigeration unit at our Yangon branch stopped cooling about twenty minutes ago. It's showing twelve degrees and we've got frozen chicken and dairy inside."
+		},
+		{ "say": "It's running, but not cooling. What should we do right now? Give me the full plan." },
+		{ "say": "Wait, stop. I already moved the food to the bar fridge.", "bargeIn": true }
+	],
+	"expect": {
+		"interrupted": true,
+		"factsAny": [
+			{
+				"keys": [
+					"backup_storage",
+					"inventory_location",
+					"affected_inventory",
+					"mitigation",
+					"food_moved",
+					"inventory_moved"
+				],
+				"valueIncludesAny": ["moved", "bar fridge", "bar"]
+			}
+		],
+		"actionsAny": [{ "titleMatches": "move|inventory|food|stock", "statusIn": ["completed"] }]
+	}
+}

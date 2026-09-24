@@ -1,0 +1,42 @@
+{
+	"id": "basic-incident",
+	"name": "Basic refrigeration incident",
+	"turns": [
+		{
+			"say": "The refrigeration unit at our Yangon branch stopped working about twenty minutes ago. The display says twelve degrees. We have frozen chicken and dairy inside."
+		},
+		{ "say": "It's still running, but it's not cooling." },
+		{ "say": "No, we don't have another freezer here." },
+		{ "say": "Thandar is the manager on shift. Please get maintenance on it." }
+	],
+	"expect": {
+		"incidentType": "refrigeration_failure",
+		"location": "yangon",
+		"facts": [
+			{
+				"key": "temperature",
+				"numeric": 12,
+				"classIn": ["unverified", "reported", "approximate"],
+				"quoteTraced": true
+			},
+			{ "key": "incident_start", "classIn": ["approximate"] },
+			{ "key": "affected_inventory", "valueIncludes": ["chicken", "dairy"] },
+			{ "key": "unit_status", "valueIncludesAny": ["running", "not cooling", "cool"] },
+			{ "key": "backup_storage" }
+		],
+		"actions": [
+			{ "titleMatches": "maintenance", "statusIn": ["pending", "in_progress", "escalated"] }
+		],
+		"severityIn": ["high", "critical"],
+		"forbiddenAgentPhrases": [
+			"sent a message",
+			"sent an sms",
+			"texted",
+			"i called",
+			"i've called",
+			"i have notified",
+			"i've notified",
+			"emailed"
+		]
+	}
+}

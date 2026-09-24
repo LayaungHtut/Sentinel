@@ -1,0 +1,10 @@
+{
+	"id": "missing-information",
+	"name": "Vague report: SENTINEL asks for the missing essentials",
+	"turns": [{ "say": "Something's wrong with the fridge. It's getting warm." }],
+	"expect": {
+		"agentAsksQuestion": true,
+		"unknownsIncludeAny": ["location", "temperature", "affected_inventory", "unit_status"],
+		"forbiddenAgentPhrases": ["yangon", "mandalay", "twelve degrees"]
+	}
+}

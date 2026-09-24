@@ -1,0 +1,40 @@
+{
+	"id": "full-demo",
+	"name": "Full 90-second demo rehearsal (barge-in, escalation, correction, report)",
+	"turns": [
+		{
+			"say": "The refrigeration unit at our Yangon branch stopped cooling about twenty minutes ago. It's showing twelve degrees and we've got frozen chicken and dairy inside."
+		},
+		{ "say": "It's running, but it's not cooling. What should we do right now?" },
+		{ "say": "Wait, stop. I already moved the food to the bar fridge.", "bargeIn": true },
+		{ "say": "Please get maintenance on it." },
+		{ "say": "Actually, I checked again. It says thirteen point four degrees." },
+		{ "say": "Generate the incident report." }
+	],
+	"waitForEscalationSeconds": 45,
+	"expect": {
+		"incidentType": "refrigeration_failure",
+		"location": "yangon",
+		"interrupted": true,
+		"facts": [
+			{ "key": "temperature", "numeric": 13.4, "classIn": ["confirmed", "reported", "unverified"] }
+		],
+		"superseded": [{ "key": "temperature", "numeric": 12 }],
+		"actionsAny": [
+			{ "titleMatches": "move|inventory|food|stock|perishable", "statusIn": ["completed"] }
+		],
+		"actions": [{ "titleMatches": "maintenance", "statusIn": ["in_progress", "escalated"] }],
+		"escalation": { "target": "Maya Win", "simulated": true },
+		"reportGenerated": true,
+		"forbiddenAgentPhrases": [
+			"sent a message",
+			"sent an sms",
+			"texted",
+			"i called",
+			"i've called",
+			"i have notified",
+			"i've notified",
+			"emailed"
+		]
+	}
+}

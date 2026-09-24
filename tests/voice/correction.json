@@ -1,0 +1,24 @@
+{
+	"id": "correction",
+	"name": "Fact correction supersedes and confirms, then report",
+	"turns": [
+		{
+			"say": "The refrigeration unit at our Yangon branch stopped cooling about twenty minutes ago. The display says twelve degrees. We have frozen chicken and dairy inside."
+		},
+		{ "say": "It's still running, but it's not cooling." },
+		{ "say": "Actually, I checked again. It says thirteen point four degrees." },
+		{ "say": "Please generate the incident report." }
+	],
+	"expect": {
+		"facts": [
+			{
+				"key": "temperature",
+				"numeric": 13.4,
+				"classIn": ["confirmed", "reported", "unverified"],
+				"status": "current"
+			}
+		],
+		"superseded": [{ "key": "temperature", "numeric": 12 }],
+		"reportGenerated": true
+	}
+}
