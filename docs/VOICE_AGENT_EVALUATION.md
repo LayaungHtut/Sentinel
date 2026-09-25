@@ -103,3 +103,12 @@ Every scenario checks the agent's spoken lines for claims of real outreach ("sen
 - The input voice is synthetic (Windows SAPI), and a synthetic voice is clean. It doesn't cover accents, background noise, soft or fast speech, or real room acoustics. A real microphone in a noisy room still needs a human rehearsal (see the manual checklist in the README).
 - The LLM is non-deterministic, so pass rates are for this run count, not a guarantee.
 - Agent audio isn't played into a real room here, so echo cancellation isn't exercised. The browser client relies on the browser's echo cancellation.
+
+## 2026-09-25: re-evaluation on the server-side relay
+
+The harness now signs in, opens the SENTINEL relay like a browser, and lets the server execute tools and fire timers. Scenario runs: **14, of which 12 passed**. Two failures led to fixes, and both scenarios passed on re-run:
+
+- **Escalation not announced:** the agent re-called `create_escalation` after the SYSTEM EVENT. Fix: duplicate-escalation guidance and a prompt rule. Passed 1/1 after.
+- **Invented fact category:** the model sent a `category` outside the list and `create_incident` was rejected. Fix: argument repair drops it. Passed 2/2 after.
+
+Full-suite results (single run each): basic-incident, correction, escalation, full-demo (13/13 checks), interruption, missing-information and pos-outage passed; ambiguous-temperature failed before its fix. Small samples: treat these as regression evidence, not a reliability estimate. The nightly workflow accumulates the larger sample.

@@ -3,6 +3,7 @@ import * as t from '../db/schema';
 import {
 	addTimeline,
 	getIncident,
+	getIncidentInOrg,
 	listContacts,
 	loadSnapshot,
 	mapAction,
@@ -36,7 +37,14 @@ import {
 	normalizeFactKey,
 	normalizeText
 } from '$lib/domain/evidence';
-import { findContactName, responseDueAt, responseTimeoutSeconds } from '$lib/domain/escalation';
+import {
+	findContact,
+	findContactName,
+	formatDuration,
+	responseDueAt
+} from '$lib/domain/escalation';
+import { queueNotification, type QueuedNotification } from '../notifications/outbox';
+import type { OrgSettings } from '$lib/domain/org-settings';
 import { CONTACT_ROLE_LABELS, getPlaybook } from '$lib/domain/playbooks';
 import { buildReport, renderReportMarkdown } from '$lib/domain/report';
 import type { ContactRole, IncidentRecord } from '$lib/domain/types';
@@ -50,6 +58,10 @@ export class ToolError extends Error {
 }
 
 export interface HandlerContext extends EngineContext {
+	/** Tenant boundary: every incident touched must belong to this organisation. */
+	orgId: string;
+	userId: string | null;
+	settings: OrgSettings;
 	incidentId: string | null;
 	isDemoSession: boolean;
 	sessionStartedAt: Date | null;
@@ -76,7 +88,7 @@ async function requireIncident(db: Tx, ctx: HandlerContext): Promise<IncidentRec
 			'No incident exists yet. Call create_incident first with what the user has reported.'
 		);
 	}
-	const incident = await getIncident(db, ctx.incidentId);
+	const incident = await getIncidentInOrg(db, ctx.orgId, ctx.incidentId);
 	if (incident.status === 'closed') {
 		throw new ToolError(`${incident.code} is closed. It can no longer be changed.`);
 	}
@@ -100,24 +112,20 @@ async function findAction(db: Tx, incidentId: string, seq: number) {
 	return mapAction(row);
 }
 
-const notificationNote = (isDemo: boolean, who: string) =>
-	isDemo
-		? `DEMO SIMULATION: outreach to ${who} is simulated — no real message was sent.`
-		: `No message was sent to ${who}: SENTINEL has no notification channel configured. Staff must contact them directly; SENTINEL tracks the response.`;
-
 // ---------------------------------------------------------------------------
 
 const createIncident: Handler<'create_incident'> = async (db, args, ctx) => {
 	if (ctx.incidentId) {
-		const existing = await getIncident(db, ctx.incidentId);
+		const existing = await getIncidentInOrg(db, ctx.orgId, ctx.incidentId);
 		throw new ToolError(
 			`${existing.code} is already open for this report. Use add_fact or update_incident instead of creating another incident.`
 		);
 	}
-	const code = await nextIncidentCode(db);
+	const code = await nextIncidentCode(db, ctx.orgId);
 	const [row] = await db
 		.insert(t.incidents)
 		.values({
+			orgId: ctx.orgId,
 			code,
 			title: args.title.trim(),
 			type: args.type,
@@ -138,6 +146,7 @@ const createIncident: Handler<'create_incident'> = async (db, args, ctx) => {
 		eventType: 'incident_created',
 		description: `Incident ${code} opened: ${incident.title}`,
 		source: timelineSource(ctx.origin),
+		actor: ctx.actorName ?? null,
 		toolName: 'create_incident',
 		refType: 'incident',
 		refId: incident.id,
@@ -194,6 +203,7 @@ const updateIncident: Handler<'update_incident'> = async (db, args, ctx) => {
 			eventType: 'incident_updated',
 			description: `Incident updated: ${changes.join('; ')}`,
 			source: timelineSource(ctx.origin),
+			actor: ctx.actorName ?? null,
 			toolName: 'update_incident',
 			occurredAt: ctx.now
 		});
@@ -298,6 +308,7 @@ const markFactUncertain: Handler<'mark_fact_uncertain'> = async (db, args, ctx) 
 		eventType: 'fact_uncertain',
 		description: `${fact.label} (${fact.value}) marked ${args.disputed ? 'DISPUTED' : 'UNCERTAIN'}: ${args.reason}`,
 		source: timelineSource(ctx.origin),
+		actor: ctx.actorName ?? null,
 		toolName: 'mark_fact_uncertain',
 		refType: 'fact',
 		refId: fact.id,
@@ -385,6 +396,7 @@ const markFactConfirmed: Handler<'mark_fact_confirmed'> = async (db, args, ctx) 
 		eventType: 'fact_confirmed',
 		description: `${fact.label} CONFIRMED: ${formatFactValue(fact as never)} — ${methodLabel}`,
 		source: timelineSource(ctx.origin),
+		actor: ctx.actorName ?? null,
 		toolName: 'mark_fact_confirmed',
 		refType: 'fact',
 		refId: fact.id,
@@ -395,6 +407,31 @@ const markFactConfirmed: Handler<'mark_fact_confirmed'> = async (db, args, ctx) 
 	return { message: `${fact.label} confirmed (${methodLabel}).` };
 };
 
+/** Queue (or honestly decline) a notification to a directory contact; see notifications/outbox. */
+async function notifyContact(
+	db: Tx,
+	incident: IncidentRecord,
+	name: string,
+	role: ContactRole | null,
+	purpose: 'contact' | 'escalation',
+	text: string,
+	ids: { actionId?: string; escalationId?: string }
+): Promise<QueuedNotification> {
+	const contacts = await listContacts(db, incident.orgId);
+	const contact =
+		contacts.find((c) => c.name.toLowerCase() === name.toLowerCase()) ??
+		(role ? findContact(role, incident.location, contacts) : null);
+	return queueNotification(db, {
+		incident,
+		contact,
+		contactName: name,
+		purpose,
+		text,
+		actionId: ids.actionId ?? null,
+		escalationId: ids.escalationId ?? null
+	});
+}
+
 async function resolveContact(
 	db: Tx,
 	incident: IncidentRecord,
@@ -402,7 +439,7 @@ async function resolveContact(
 	name: string | undefined
 ): Promise<{ name: string | null; role: ContactRole | null }> {
 	if (!role && !name) return { name: null, role: null };
-	const contacts = await listContacts(db);
+	const contacts = await listContacts(db, incident.orgId);
 	if (name) {
 		const match = contacts.find((c) => c.name.toLowerCase().includes(name.toLowerCase().trim()));
 		return { name: match?.name ?? name.trim(), role: role ?? (match?.role as ContactRole) ?? null };
@@ -486,13 +523,9 @@ const addAction: Handler<'add_action'> = async (db, args, ctx) => {
 				requiresResponse: !!contact.name && requiresResponse,
 				responseDueAt:
 					a.status === 'in_progress' && contact.name && requiresResponse
-						? responseDueAt(ctx.now, incident.isDemo)
+						? responseDueAt(ctx.now, ctx.settings.responseTimeoutSeconds)
 						: null,
-				notificationStatus: contact.name
-					? incident.isDemo
-						? 'simulated'
-						: 'not_configured'
-					: null,
+				notificationStatus: null,
 				origin: ctx.origin === 'operator' ? 'operator' : 'agent',
 				reasonFactId: reasonFact?.id ?? null,
 				createdAt: ctx.now,
@@ -506,22 +539,37 @@ const addAction: Handler<'add_action'> = async (db, args, ctx) => {
 			eventType: 'action_created',
 			description: `Action A${seq} added: ${row.title} — ${a.status.replace('_', ' ').toUpperCase()}${contact.name ? ` (contact: ${contact.name})` : ''}`,
 			source: timelineSource(ctx.origin),
+			actor: ctx.actorName ?? null,
 			toolName: 'add_action',
 			refType: 'action',
 			refId: row.id,
 			occurredAt: ctx.now
 		});
 		if (a.status === 'in_progress' && contact.name) {
+			const q = await notifyContact(
+				db,
+				incident,
+				contact.name,
+				contact.role,
+				'contact',
+				`${incident.title}${incident.location ? ` at ${incident.location}` : ''}. Action needed: ${row.title}.`,
+				{ actionId: row.id }
+			);
+			await db
+				.update(t.actions)
+				.set({ notificationStatus: q.status })
+				.where(eq(t.actions.id, row.id));
 			await addTimeline(db, {
 				incidentId: incident.id,
 				eventType: 'contact_initiated',
-				description: `Contact with ${contact.name} initiated for A${seq}. ${notificationNote(incident.isDemo, contact.name)}`,
+				description: `Contact with ${contact.name} initiated for A${seq}. ${q.statement}`,
 				source: incident.isDemo ? 'demo_simulation' : timelineSource(ctx.origin),
+				actor: ctx.actorName ?? null,
 				refType: 'action',
 				refId: row.id,
 				occurredAt: ctx.now
 			});
-			notes.push(notificationNote(incident.isDemo, contact.name));
+			notes.push(q.statement);
 		}
 		created.push(
 			`A${seq} ${row.title} [${a.status}]${contact.name ? ` contact ${contact.name}` : ''}`
@@ -571,19 +619,33 @@ const updateAction: Handler<'update_action'> = async (db, args, ctx) => {
 		!action.responseReceivedAt &&
 		!action.responseDueAt
 	) {
-		patch.responseDueAt = responseDueAt(ctx.now, incident.isDemo);
+		patch.responseDueAt = responseDueAt(ctx.now, ctx.settings.responseTimeoutSeconds);
 	}
 	if (args.status === 'completed') patch.completedAt = ctx.now;
 	await db.update(t.actions).set(patch).where(eq(t.actions.id, action.id));
 
 	const extra: string[] = [];
 	if (args.status === 'in_progress' && action.contactName && !action.startedAt) {
-		extra.push(notificationNote(incident.isDemo, action.contactName));
+		const q = await notifyContact(
+			db,
+			incident,
+			action.contactName,
+			action.contactRole,
+			'contact',
+			`${incident.title}${incident.location ? ` at ${incident.location}` : ''}. Action needed: ${action.title}.`,
+			{ actionId: action.id }
+		);
+		await db
+			.update(t.actions)
+			.set({ notificationStatus: q.status })
+			.where(eq(t.actions.id, action.id));
+		extra.push(q.statement);
 		await addTimeline(db, {
 			incidentId: incident.id,
 			eventType: 'contact_initiated',
-			description: `Contact with ${action.contactName} initiated for A${action.seq}. ${notificationNote(incident.isDemo, action.contactName)}`,
+			description: `Contact with ${action.contactName} initiated for A${action.seq}. ${q.statement}`,
 			source: incident.isDemo ? 'demo_simulation' : timelineSource(ctx.origin),
+			actor: ctx.actorName ?? null,
 			refType: 'action',
 			refId: action.id,
 			occurredAt: ctx.now
@@ -594,6 +656,7 @@ const updateAction: Handler<'update_action'> = async (db, args, ctx) => {
 		eventType: 'action_updated',
 		description: `A${action.seq} ${action.title}: ${action.status.replace('_', ' ').toUpperCase()} → ${args.status.replace('_', ' ').toUpperCase()}${args.blocked_reason ? ` — ${args.blocked_reason}` : args.note ? ` — ${args.note}` : ''}`,
 		source: timelineSource(ctx.origin),
+		actor: ctx.actorName ?? null,
 		toolName: 'update_action',
 		refType: 'action',
 		refId: action.id,
@@ -606,7 +669,7 @@ const updateAction: Handler<'update_action'> = async (db, args, ctx) => {
 		await applyAutoProgression(db, incident.id, 'action_blocked', ctx);
 	}
 	const awaiting = patch.responseDueAt
-		? ` Awaiting response from ${action.contactName}; escalates automatically after ${responseTimeoutSeconds(incident.isDemo)}s without reply${incident.isDemo ? ' (demo timing)' : ''}.`
+		? ` Awaiting response from ${action.contactName}; escalates automatically after ${formatDuration(ctx.settings.responseTimeoutSeconds)} without reply${incident.isDemo ? ' (demo timing)' : ''}.`
 		: '';
 	return {
 		message: `A${action.seq} ${action.title} is now ${args.status.replace('_', ' ')}.${awaiting}`,
@@ -660,6 +723,7 @@ const requestInformation: Handler<'request_information'> = async (db, args, ctx)
 					? `${label} UNKNOWN — reporter does not know${args.note ? ` (${args.note})` : ''}`
 					: `${label} marked not applicable`,
 		source: timelineSource(ctx.origin),
+		actor: ctx.actorName ?? null,
 		toolName: 'request_information',
 		occurredAt: ctx.now
 	});
@@ -689,6 +753,7 @@ const recordResponse: Handler<'record_response'> = async (db, args, ctx) => {
 		eventType: 'response_received',
 		description: `Response on A${action.seq} from ${args.responder}: “${args.response}”${ctx.origin === 'demo_simulation' ? ' (DEMO SIMULATION)' : ''}`,
 		source: timelineSource(ctx.origin),
+		actor: ctx.actorName ?? null,
 		toolName: 'record_response',
 		refType: 'action',
 		refId: action.id,
@@ -718,7 +783,10 @@ const createEscalation: Handler<'create_escalation'> = async (db, args, ctx) => 
 			)
 		);
 	if (openDup && (!action || openDup.actionId === action.id || openDup.actionId === null)) {
-		return { message: `Escalation E${openDup.seq} to ${targetName} is already open.` };
+		return {
+			message: `Escalation E${openDup.seq} to ${targetName} is already open (${openDup.reason}).`,
+			guidance: `Nothing new was created. Tell the user in one sentence that it has been escalated to ${targetName}${openDup.trigger === 'response_timeout' ? ' because nobody responded in time' : ''}, then continue.`
+		};
 	}
 	const seq = await nextSeq(db, t.escalations, incident.id);
 	const priorForAction = action
@@ -737,10 +805,23 @@ const createEscalation: Handler<'create_escalation'> = async (db, args, ctx) => 
 			trigger: ctx.origin === 'operator' ? 'operator' : 'agent',
 			status: 'open',
 			simulated: incident.isDemo,
-			notificationStatus: incident.isDemo ? 'simulated' : 'not_configured',
+			notificationStatus: 'queued',
 			createdAt: ctx.now
 		})
 		.returning();
+	const q = await notifyContact(
+		db,
+		incident,
+		targetName,
+		contact.role ?? role,
+		'escalation',
+		`${incident.title}${incident.location ? ` at ${incident.location}` : ''}. ${args.reason}`,
+		{ escalationId: row.id }
+	);
+	await db
+		.update(t.escalations)
+		.set({ notificationStatus: q.status })
+		.where(eq(t.escalations.id, row.id));
 	if (action && ['in_progress', 'blocked'].includes(action.status)) {
 		await db
 			.update(t.actions)
@@ -750,8 +831,9 @@ const createEscalation: Handler<'create_escalation'> = async (db, args, ctx) => 
 	await addTimeline(db, {
 		incidentId: incident.id,
 		eventType: 'escalation_created',
-		description: `Escalation E${seq} to ${targetName}: ${args.reason} — ${notificationNote(incident.isDemo, targetName)}`,
+		description: `Escalation E${seq} to ${targetName}: ${args.reason} — ${q.statement}`,
 		source: incident.isDemo ? 'demo_simulation' : timelineSource(ctx.origin),
+		actor: ctx.actorName ?? null,
 		toolName: 'create_escalation',
 		refType: 'escalation',
 		refId: row.id,
@@ -760,9 +842,7 @@ const createEscalation: Handler<'create_escalation'> = async (db, args, ctx) => 
 	await applyAutoProgression(db, incident.id, 'escalation_opened', ctx);
 	return {
 		message: `Escalation E${seq} opened to ${targetName}.`,
-		guidance:
-			notificationNote(incident.isDemo, targetName) +
-			' Say this plainly; never claim a message or call was sent.'
+		guidance: `${q.statement} Say only what that sentence says; never claim a message was delivered.`
 	};
 };
 
@@ -792,6 +872,7 @@ const resolveEscalation: Handler<'resolve_escalation'> = async (db, args, ctx) =
 		eventType: args.status === 'resolved' ? 'escalation_resolved' : 'escalation_acknowledged',
 		description: `Escalation E${esc.seq} (${esc.targetName}) ${args.status.toUpperCase()}: ${args.note}${ctx.origin === 'demo_simulation' ? ' (DEMO SIMULATION)' : ''}`,
 		source: timelineSource(ctx.origin),
+		actor: ctx.actorName ?? null,
 		toolName: 'resolve_escalation',
 		refType: 'escalation',
 		refId: esc.id,
@@ -822,6 +903,7 @@ const addTimelineEvent: Handler<'add_timeline_event'> = async (db, args, ctx) =>
 		eventType: args.event_type,
 		description: args.description.trim(),
 		source: timelineSource(ctx.origin),
+		actor: ctx.actorName ?? null,
 		toolName: 'add_timeline_event',
 		occurredAt: ctx.now
 	});
@@ -852,6 +934,7 @@ const generateIncidentReport: Handler<'generate_incident_report'> = async (db, _
 		eventType: 'report_generated',
 		description: `Incident report v${version} generated from ${report.evidenceStats.facts} facts and ${snap.timeline.length} timeline events`,
 		source: timelineSource(ctx.origin),
+		actor: ctx.actorName ?? null,
 		toolName: 'generate_incident_report',
 		occurredAt: ctx.now
 	});

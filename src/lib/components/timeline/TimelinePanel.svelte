@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Clock, Plus } from '@lucide/svelte';
+	import { Clock, Plus, ShieldAlert, ShieldCheck } from '@lucide/svelte';
 	import type { IncidentView, TimelineView } from '$lib/domain/view';
 	import { fmtClock } from '$lib/utils/format';
 
@@ -22,11 +22,20 @@
 		voice: { label: 'voice', cls: 'text-voice' },
 		operator: { label: 'operator', cls: 'text-ink-300' },
 		system: { label: 'system', cls: 'text-ink-400' },
-		demo_simulation: { label: 'demo sim', cls: 'text-voice' }
+		demo_simulation: { label: 'demo sim', cls: 'text-voice' },
+		external: { label: 'recipient', cls: 'text-ok' },
+		sensor: { label: 'sensor', cls: 'text-info' }
 	};
 
 	function tone(type: string): string {
-		if (type.startsWith('escalation_created') || type === 'voice_error') return 'bg-crit';
+		if (
+			type.startsWith('escalation_created') ||
+			type === 'voice_error' ||
+			type === 'notification_failed'
+		)
+			return 'bg-crit';
+		if (type === 'notification_delivered' || type === 'notification_acknowledged') return 'bg-ok';
+		if (type.startsWith('notification')) return 'bg-info';
 		if (type.startsWith('escalation')) return 'bg-warn';
 		if (type === 'severity_assessed') return 'bg-high';
 		if (type === 'fact_superseded' || type === 'fact_uncertain') return 'bg-warn';
@@ -59,7 +68,15 @@
 		voice_ended: 'Voice ended',
 		voice_error: 'Voice error',
 		voice_disconnected: 'Voice lost',
-		voice_resumed: 'Voice restored'
+		voice_resumed: 'Voice restored',
+		notification_sent: 'Message sent',
+		notification_delivered: 'Delivered',
+		notification_failed: 'Not delivered',
+		notification_acknowledged: 'Acknowledged',
+		attachment_added: 'Photo',
+		transcript_redacted: 'Redaction',
+		retention_redaction: 'Retention',
+		transcript_reconciled: 'Transcript check'
 	};
 	const typeLabel = (t: string) => TYPE_LABELS[t] ?? t.replace(/_/g, ' ');
 
@@ -74,7 +91,28 @@
 		<span class="flex items-center gap-1.5 eyebrow"
 			><Clock class="size-3.5" /> Evidence timeline</span
 		>
-		<span class="text-[11px] text-ink-400">{view.timeline.length} events</span>
+		<span class="flex items-center gap-2 text-[11px] text-ink-400">
+			{#if view.audit.ok}
+				<span
+					class="flex items-center gap-1 text-ok"
+					title="Every event is hash-chained (SHA-256) and the database rejects edits and deletions. Chain head {view.audit.headHash?.slice(
+						0,
+						16
+					) ?? '—'}…"
+				>
+					<ShieldCheck class="size-3.5" /> chain verified
+				</span>
+			{:else}
+				<span
+					class="flex items-center gap-1 text-crit"
+					role="alert"
+					title={view.audit.reason ?? ''}
+				>
+					<ShieldAlert class="size-3.5" /> integrity check failed: {view.audit.reason}
+				</span>
+			{/if}
+			<span>{view.timeline.length} events</span>
+		</span>
 	</div>
 
 	{#if !readOnly}

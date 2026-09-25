@@ -15,6 +15,12 @@ export interface DbHandle {
 	db: Database;
 	driver: 'postgres' | 'pglite';
 	close: () => Promise<void>;
+	/**
+	 * Try to become the job leader: holds a session-level advisory lock on a
+	 * dedicated connection for the life of the process (released automatically
+	 * if the process dies). PGlite is single-process, so it is always leader.
+	 */
+	tryLeaderLock: (key: number) => Promise<boolean>;
 }
 
 let handlePromise: Promise<DbHandle> | null = null;
@@ -47,7 +53,27 @@ export async function createDb(options: {
 			const { migrate } = await import('drizzle-orm/node-postgres/migrator');
 			await migrate(db, { migrationsFolder: migrationsFolder() });
 		}
-		return { db: db as unknown as Database, driver: 'postgres', close: () => pool.end() };
+		let leaderClient: import('pg').PoolClient | null = null;
+		return {
+			db: db as unknown as Database,
+			driver: 'postgres',
+			close: async () => {
+				leaderClient?.release();
+				await pool.end();
+			},
+			tryLeaderLock: async (key) => {
+				if (leaderClient) return true;
+				const client = await pool.connect();
+				const r = await client.query('select pg_try_advisory_lock($1) as ok', [key]);
+				if (r.rows[0]?.ok) {
+					leaderClient = client;
+					client.on('error', () => (leaderClient = null));
+					return true;
+				}
+				client.release();
+				return false;
+			}
+		};
 	}
 	const { PGlite } = await import('@electric-sql/pglite');
 	const { drizzle } = await import('drizzle-orm/pglite');
@@ -59,7 +85,12 @@ export async function createDb(options: {
 		const { migrate } = await import('drizzle-orm/pglite/migrator');
 		await migrate(db, { migrationsFolder: migrationsFolder() });
 	}
-	return { db: db as unknown as Database, driver: 'pglite', close: () => client.close() };
+	return {
+		db: db as unknown as Database,
+		driver: 'pglite',
+		close: () => client.close(),
+		tryLeaderLock: async () => true
+	};
 }
 
 /** Lazily-initialised process-wide database (migrations applied on first use). */

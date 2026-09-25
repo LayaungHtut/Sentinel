@@ -1,110 +1,101 @@
 /**
- * LIVE reconnect check against the real AssemblyAI Voice Agent API (billed; never prints the key).
- * 1) start a session through SENTINEL (/api/voice/session) and wait for session.ready
- * 2) drop the socket WITHOUT session.end (simulated network loss)
- * 3) mint a fresh single-use token via /api/voice/session/:id/token
- * 4) reconnect and send session.resume with the saved session_id, expect session.ready
- * 5) end cleanly with session.end → session.ended
- * Usage: npm run build && node --env-file=.env scripts/live-resume.mjs
+ * LIVE probe of AssemblyAI Voice Agent `session.resume` (billed; never prints the key).
+ *
+ * SENTINEL's relay connects server-side with `Authorization: Bearer <key>`, so this
+ * probe does exactly the same, with no app involved:
+ *   1) open a session, wait for session.ready, note session_id
+ *   2) drop the socket WITHOUT session.end (simulated network loss)
+ *   3) wait N seconds, reconnect, send { type: 'session.resume', session_id }
+ *   4) record the outcome (session.ready vs session.error code/message), end cleanly
+ * Repeats for several delays. Output: console + .data/voice-results/resume-probe-<ts>.json
+ * (suitable for attaching to a support ticket; contains no credentials).
+ *
+ * Usage: node --env-file=.env scripts/live-resume.mjs [--delays 1,5,15]
  */
-import http from 'node:http';
-import { rmSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import WebSocket from 'ws';
 
-if (!process.env.ASSEMBLYAI_API_KEY) {
+const key = process.env.ASSEMBLYAI_API_KEY?.trim();
+if (!key) {
 	console.error('ASSEMBLYAI_API_KEY is not configured.');
 	process.exit(1);
 }
-process.env.DATABASE_URL = '';
-process.env.PGLITE_DATA_DIR = '.data/live-resume-db';
-rmSync(process.env.PGLITE_DATA_DIR, { recursive: true, force: true });
-const { handler } = await import('../build/handler.js');
-const server = http.createServer(handler);
-await new Promise((r) => server.listen(0, '127.0.0.1', r));
-const base = `http://127.0.0.1:${server.address().port}`;
-const post = async (p, b) => {
-	const r = await fetch(base + p, {
-		method: 'POST',
-		headers: { 'content-type': 'application/json' },
-		body: JSON.stringify(b ?? {})
-	});
-	return { status: r.status, body: await r.json().catch(() => null) };
-};
-const results = [];
-const check = (name, ok, detail = '') => {
-	results.push({ name, ok });
-	console.log(`${ok ? '✓' : '✗'} ${name}${detail ? ` — ${detail}` : ''}`);
-};
-const waitFor = (ws, pred, ms = 15000) =>
+const URL_WS = process.env.ASSEMBLYAI_WS_URL || 'wss://agents.assemblyai.com/v1/ws';
+const di = process.argv.indexOf('--delays');
+const delays = (di >= 0 ? process.argv[di + 1] : '1,5,15').split(',').map(Number);
+
+const open = () => new WebSocket(URL_WS, { headers: { Authorization: `Bearer ${key}` } });
+const next = (ws, pred, ms = 15000) =>
 	new Promise((resolve, reject) => {
 		const t = setTimeout(() => reject(new Error('timeout')), ms);
-		ws.addEventListener('message', (ev) => {
-			const m = JSON.parse(ev.data);
+		const onMsg = (raw) => {
+			const m = JSON.parse(String(raw));
 			if (pred(m)) {
 				clearTimeout(t);
+				ws.off('message', onMsg);
 				resolve(m);
 			}
-		});
-		ws.addEventListener('close', (e) => {
+		};
+		ws.on('message', onMsg);
+		ws.once('close', (code, reason) => {
 			clearTimeout(t);
-			reject(new Error(`closed ${e.code}`));
+			reject(new Error(`closed ${code} ${String(reason)}`));
+		});
+		ws.once('error', (e) => {
+			clearTimeout(t);
+			reject(e);
 		});
 	});
 
-const start = await post('/api/voice/session', {});
-check('token minted through SENTINEL', start.status === 200);
-const { voiceSessionId, token, wsUrl, sessionUpdate } = start.body;
-const ws1 = new WebSocket(`${wsUrl}?token=${encodeURIComponent(token)}`);
-ws1.onopen = () => ws1.send(JSON.stringify({ type: 'session.update', session: sessionUpdate }));
-const ready1 = await waitFor(ws1, (m) => m.type === 'session.ready');
-const sessionId = ready1.session_id;
-check('first session.ready', !!sessionId);
+const results = [];
+for (const delay of delays) {
+	const r = { delaySeconds: delay, at: new Date().toISOString() };
+	try {
+		const ws1 = open();
+		await new Promise((res, rej) => (ws1.once('open', res), ws1.once('error', rej)));
+		ws1.send(
+			JSON.stringify({
+				type: 'session.update',
+				session: { system_prompt: 'You are a connectivity probe. Say nothing unless asked.' }
+			})
+		);
+		const ready = await next(ws1, (m) => m.type === 'session.ready' || m.type === 'session.error');
+		if (ready.type !== 'session.ready')
+			throw new Error(`first session: ${ready.code} ${ready.message}`);
+		r.sessionId = ready.session_id;
+		ws1.terminate(); // abrupt drop, no session.end
+		await new Promise((res) => setTimeout(res, delay * 1000));
 
-// Simulated network drop: close without session.end.
-ws1.close();
-await new Promise((r) => setTimeout(r, 2000));
-
-const fresh = await post(`/api/voice/session/${voiceSessionId}/token`);
-check('fresh single-use token for resume', fresh.status === 200);
-const ws2 = new WebSocket(`${wsUrl}?token=${encodeURIComponent(fresh.body.token)}`);
-ws2.onopen = () => ws2.send(JSON.stringify({ type: 'session.resume', session_id: sessionId }));
-try {
-	const ready2 = await waitFor(
-		ws2,
-		(m) => m.type === 'session.ready' || m.type === 'session.error'
+		const ws2 = open();
+		await new Promise((res, rej) => (ws2.once('open', res), ws2.once('error', rej)));
+		ws2.send(JSON.stringify({ type: 'session.resume', session_id: r.sessionId }));
+		const out = await next(
+			ws2,
+			(m) => m.type === 'session.ready' || m.type === 'session.error'
+		).catch((e) => ({ type: 'closed', message: e.message }));
+		r.outcome = out.type;
+		r.code = out.code ?? null;
+		r.message = out.message ?? null;
+		r.sameSessionId = out.type === 'session.ready' ? out.session_id === r.sessionId : null;
+		if (ws2.readyState === WebSocket.OPEN) {
+			ws2.send(JSON.stringify({ type: 'session.end' }));
+			await next(ws2, (m) => m.type === 'session.ended', 5000).catch(() => null);
+			ws2.close();
+		}
+	} catch (e) {
+		r.outcome = 'probe_error';
+		r.message = e.message;
+	}
+	results.push(r);
+	console.log(
+		`${r.outcome === 'session.ready' ? '✓' : '✗'} resume after ${delay}s → ${r.outcome}${r.code ? ` (${r.code})` : ''}${r.message ? `: ${r.message}` : ''}`
 	);
-	check(
-		'session.resume accepted',
-		ready2.type === 'session.ready',
-		ready2.type === 'session.error'
-			? `${ready2.code}: ${ready2.message}`
-			: `same id: ${ready2.session_id === sessionId}`
-	);
-	ws2.send(JSON.stringify({ type: 'session.end' }));
-	const ended = await waitFor(ws2, (m) => m.type === 'session.ended');
-	check('session.end → session.ended after resume', !!ended);
-} catch (e) {
-	check('session.resume accepted', false, e.message);
 }
 
-// Reusing a consumed token must fail (single-use).
-const ws3 = new WebSocket(`${wsUrl}?token=${encodeURIComponent(token)}`);
-ws3.onopen = () => ws3.send(JSON.stringify({ type: 'session.update', session: sessionUpdate }));
-try {
-	const r = await waitFor(
-		ws3,
-		(m) => m.type === 'session.ready' || m.type === 'session.error',
-		8000
-	);
-	check(
-		'consumed token is rejected (single-use)',
-		r.type === 'session.error',
-		r.type === 'session.error' ? r.code : 'unexpectedly accepted'
-	);
-	if (r.type === 'session.ready') ws3.send(JSON.stringify({ type: 'session.end' }));
-} catch (e) {
-	check('consumed token is rejected (single-use)', true, e.message);
-}
-
-server.close();
-console.log(`\n${results.filter((r) => r.ok).length}/${results.length} checks passed`);
+mkdirSync('.data/voice-results', { recursive: true });
+const out = `.data/voice-results/resume-probe-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+writeFileSync(out, JSON.stringify({ endpoint: URL_WS, results }, null, 1));
+console.log(
+	`\n${results.filter((r) => r.outcome === 'session.ready').length}/${results.length} resumes accepted. Written to ${out}`
+);
 process.exit(0);

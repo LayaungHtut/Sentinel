@@ -1,0 +1,33 @@
+# Local production-like stack: PostgreSQL 17 + SENTINEL.
+#   cp .env.example .env   # fill in ASSEMBLYAI_API_KEY, DATA_ENCRYPTION_KEY, ...
+#   docker compose up --build
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sentinel-local-only}
+      POSTGRES_DB: sentinel
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U sentinel']
+      interval: 5s
+      retries: 10
+
+  app:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://sentinel:${POSTGRES_PASSWORD:-sentinel-local-only}@db:5432/sentinel
+      ORIGIN: ${ORIGIN:-http://localhost:3000}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3000}
+    ports:
+      - '3000:3000'
+    depends_on:
+      db:
+        condition: service_healthy
+    stop_grace_period: 15s
+
+volumes:
+  pgdata:

@@ -51,7 +51,8 @@ export const FACT_CERTAINTIES = ['exact', 'approximate'] as const;
 export type FactCertainty = (typeof FACT_CERTAINTIES)[number];
 
 /** Where the value came from: said directly, or reasoned by the system. */
-export const FACT_BASES = ['stated', 'inferred'] as const;
+/** stated = someone said it; inferred = SENTINEL concluded it; observed = an instrument (sensor) measured it. */
+export const FACT_BASES = ['stated', 'inferred', 'observed'] as const;
 export type FactBasis = (typeof FACT_BASES)[number];
 
 export const FACT_VERIFICATIONS = ['unverified', 'confirmed', 'disputed'] as const;
@@ -78,7 +79,8 @@ export const SOURCE_TYPES = [
 	'operator_entry',
 	'agent_inference',
 	'system',
-	'demo_simulation'
+	'demo_simulation',
+	'sensor'
 ] as const;
 export type SourceType = (typeof SOURCE_TYPES)[number];
 
@@ -103,7 +105,18 @@ export type EscalationTrigger = (typeof ESCALATION_TRIGGERS)[number];
  * Notification delivery state. SENTINEL ships with no outbound messaging
  * integration, so nothing is ever reported as "sent".
  */
-export const NOTIFICATION_STATUSES = ['not_configured', 'simulated'] as const;
+/**
+ * Delivery state shown on actions/escalations. Only 'sent'/'delivered' ever
+ * claim a real message went out, and only after the provider accepted it.
+ */
+export const NOTIFICATION_STATUSES = [
+	'not_configured',
+	'simulated',
+	'queued',
+	'sent',
+	'delivered',
+	'failed'
+] as const;
 export type NotificationStatus = (typeof NOTIFICATION_STATUSES)[number];
 
 export const CONTACT_ROLES = [
@@ -121,7 +134,7 @@ export type ContactRole = (typeof CONTACT_ROLES)[number];
  * never drift from the underlying certainty/basis/verification fields.
  */
 export type EpistemicClass =
-	'confirmed' | 'reported' | 'unverified' | 'approximate' | 'inferred' | 'disputed';
+	'confirmed' | 'reported' | 'unverified' | 'approximate' | 'inferred' | 'disputed' | 'observed';
 
 export interface FactRecord {
 	id: string;
@@ -144,6 +157,8 @@ export interface FactRecord {
 	evidenceQuote: string | null;
 	quoteMatched: boolean | null;
 	speaker: string | null;
+	/** Sensor / device id for observed facts. */
+	sourceRef: string | null;
 	observedAt: Date;
 	confirmedAt: Date | null;
 	confirmationNote: string | null;
@@ -215,13 +230,17 @@ export interface TimelineRecord {
 	incidentId: string;
 	eventType: string;
 	description: string;
-	source: 'voice' | 'agent_tool' | 'operator' | 'system' | 'demo_simulation';
+	source:
+		'voice' | 'agent_tool' | 'operator' | 'system' | 'demo_simulation' | 'external' | 'sensor';
 	actor: string | null;
 	toolName: string | null;
 	refType: string | null;
 	refId: string | null;
 	metadata: Record<string, unknown> | null;
 	occurredAt: Date;
+	chainSeq: number;
+	prevHash: string | null;
+	hash: string | null;
 }
 
 export interface TranscriptRecord {
@@ -229,7 +248,12 @@ export interface TranscriptRecord {
 	voiceSessionId: string | null;
 	incidentId: string | null;
 	speaker: 'user' | 'agent' | 'system';
+	/** Which person spoke (multi-reporter attribution). */
+	userId: string | null;
 	text: string;
+	/** AssemblyAI STT confidence for this utterance, from post-session reconciliation. */
+	sttConfidence: number | null;
+	redactedAt: Date | null;
 	channel: 'voice' | 'typed';
 	interrupted: boolean;
 	offsetMs: number | null;
@@ -238,6 +262,7 @@ export interface TranscriptRecord {
 
 export interface IncidentRecord {
 	id: string;
+	orgId: string;
 	code: string;
 	title: string;
 	type: IncidentType;
@@ -261,13 +286,17 @@ export interface IncidentRecord {
 
 export interface ContactRecord {
 	id: string;
+	orgId: string;
 	name: string;
 	role: ContactRole;
 	roleLabel: string;
 	site: string | null;
 	organization: string;
 	isDemo: boolean;
-	notificationChannel: 'none';
+	notificationChannel: string;
+	phone: string | null;
+	email: string | null;
+	onCall: boolean;
 }
 
 export interface ReportRecord {
@@ -308,3 +337,20 @@ export interface IncidentSnapshot {
 	transcripts: TranscriptRecord[];
 	contacts: ContactRecord[];
 }
+
+/** Access roles, lowest to highest. */
+export const USER_ROLES = ['reporter', 'coordinator', 'manager', 'admin'] as const;
+export type UserRole = (typeof USER_ROLES)[number];
+
+export const NOTIFICATION_CHANNELS = ['sms', 'voice_call', 'email', 'slack', 'webhook'] as const;
+export type NotificationChannel = (typeof NOTIFICATION_CHANNELS)[number];
+
+export const NOTIFICATION_STATES = [
+	'queued',
+	'sent',
+	'delivered',
+	'failed',
+	'simulated',
+	'not_configured'
+] as const;
+export type NotificationState = (typeof NOTIFICATION_STATES)[number];

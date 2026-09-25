@@ -68,6 +68,7 @@ export type FactInput = z.infer<typeof factInput>;
  * sending it). Live testing showed a relaxed schema made the model omit values
  * more often. When a value is still missing, derive it from numeric_value/unit,
  * minutes_ago or the evidence quote instead of failing the whole call.
+ * An invented optional `category` is dropped.
  */
 export function repairToolArguments(
 	name: string,
@@ -80,6 +81,15 @@ export function repairToolArguments(
 		a.facts = a.facts.map((f: unknown, i: number) => {
 			if (!f || typeof f !== 'object') return f;
 			const fact = { ...(f as Record<string, unknown>) };
+			// category is optional display metadata (the playbook supplies it). Live runs showed
+			// the model sometimes invents one; drop it rather than reject the whole call.
+			if (
+				fact.category !== undefined &&
+				!(FACT_CATEGORIES as readonly unknown[]).includes(fact.category)
+			) {
+				repairs.push(`facts.${i}.category "${String(fact.category).slice(0, 30)}" dropped`);
+				delete fact.category;
+			}
 			const v = typeof fact.value === 'string' ? fact.value.trim() : '';
 			if (v) return fact;
 			let derived: string | null = null;

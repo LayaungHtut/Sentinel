@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const envMock = vi.hoisted(() => ({ env: {} as Record<string, string | undefined> }));
-vi.mock('$env/dynamic/private', () => envMock);
+vi.mock('$lib/server/env', () => envMock);
 
-import { mintVoiceAgentToken, TokenError, VOICE_AGENT_WS_URL } from './token';
+import { isAssemblyAIConfigured, VOICE_AGENT_WS_URL } from './token';
 import {
 	buildSessionUpdate,
 	buildTools,
@@ -11,34 +11,20 @@ import {
 	SUPPORTED_VOICES,
 	toolsForTier
 } from './session-config';
-import { TOOL_NAMES } from '../tools/schemas';
+import { repairToolArguments, TOOL_NAMES, TOOL_SCHEMAS } from '../tools/schemas';
 
 afterEach(() => {
 	envMock.env = {};
 });
 
-describe('temporary token minting (mocked AssemblyAI)', () => {
-	it('calls the documented token endpoint with a Bearer key and bounded TTLs', async () => {
+describe('AssemblyAI configuration', () => {
+	it('is configured only by a non-blank server-side key and uses the documented endpoint', () => {
+		expect(isAssemblyAIConfigured()).toBe(false);
+		envMock.env.ASSEMBLYAI_API_KEY = '   ';
+		expect(isAssemblyAIConfigured()).toBe(false);
 		envMock.env.ASSEMBLYAI_API_KEY = 'test-key';
-		const fetchMock = vi.fn(
-			async () => new Response(JSON.stringify({ token: 'tmp-123', expires_in_seconds: 60 }))
-		);
-		const token = await mintVoiceAgentToken(fetchMock as unknown as typeof fetch);
-		expect(token).toBe('tmp-123');
-		const [url, init] = fetchMock.mock.calls[0] as unknown as [URL, RequestInit];
-		expect(url.origin + url.pathname).toBe('https://agents.assemblyai.com/v1/token');
-		expect(Number(url.searchParams.get('expires_in_seconds'))).toBeLessThanOrEqual(600);
-		expect(Number(url.searchParams.get('max_session_duration_seconds'))).toBeGreaterThanOrEqual(60);
-		expect((init.headers as Record<string, string>).Authorization).toBe('Bearer test-key');
+		expect(isAssemblyAIConfigured()).toBe(true);
 		expect(VOICE_AGENT_WS_URL).toBe('wss://agents.assemblyai.com/v1/ws');
-	});
-	it('fails clearly without a key and never echoes upstream bodies', async () => {
-		await expect(mintVoiceAgentToken(vi.fn() as never)).rejects.toThrow(/not configured/);
-		envMock.env.ASSEMBLYAI_API_KEY = 'bad';
-		const fetchMock = vi.fn(async () => new Response('{"error":"secret detail"}', { status: 401 }));
-		const err = await mintVoiceAgentToken(fetchMock as unknown as typeof fetch).catch((e) => e);
-		expect(err).toBeInstanceOf(TokenError);
-		expect(err.message).not.toContain('secret detail');
 	});
 });
 
@@ -94,7 +80,10 @@ describe('voice agent session configuration', () => {
 		expect(first.session).toHaveProperty('output.voice');
 		const prompt = String(first.session.system_prompt);
 		expect(prompt).toMatch(/NEVER INVENT/);
-		expect(prompt).toMatch(/Never say you sent, called, messaged or notified anyone/);
+		expect(prompt).toMatch(
+			/Never claim you called, messaged or notified anyone unless a tool result or SYSTEM EVENT says so/
+		);
+		expect(prompt).toMatch(/"sent" is not "delivered"/);
 		expect(prompt).toMatch(/DEMO MODE/);
 		const later = buildSessionUpdate({
 			now: new Date(),
@@ -106,5 +95,34 @@ describe('voice agent session configuration', () => {
 		});
 		expect(later.session).not.toHaveProperty('greeting');
 		expect(later.session).not.toHaveProperty('output');
+	});
+});
+
+describe('tool argument repair (observed live)', () => {
+	it('drops an invented fact category instead of rejecting the call, and keeps valid ones', () => {
+		const { args, repairs } = repairToolArguments('create_incident', {
+			title: 'Freezer failure',
+			type: 'refrigeration_failure',
+			facts: [
+				{
+					key: 'temperature',
+					value: '12°C',
+					certainty: 'exact',
+					basis: 'stated',
+					category: 'temperature'
+				},
+				{
+					key: 'location',
+					value: 'Yangon',
+					certainty: 'exact',
+					basis: 'stated',
+					category: 'location'
+				}
+			]
+		});
+		expect(repairs).toEqual(['facts.0.category "temperature" dropped']);
+		const parsed = TOOL_SCHEMAS.create_incident.safeParse(args);
+		expect(parsed.success).toBe(true);
+		if (parsed.success) expect(parsed.data.facts[1].category).toBe('location');
 	});
 });

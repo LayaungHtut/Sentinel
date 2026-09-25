@@ -1,8 +1,8 @@
-import { env } from '$env/dynamic/private';
+import { env } from '$lib/server/env';
 import { toParametersJsonSchema, type ToolName } from '../tools/schemas';
 import { agentStateSummary } from '../incidents/engine';
 import { PLAYBOOKS } from '$lib/domain/playbooks';
-import { responseTimeoutSeconds } from '$lib/domain/escalation';
+import { formatDuration, responseTimeoutSeconds } from '$lib/domain/escalation';
 import type { ContactRecord, IncidentSnapshot } from '$lib/domain/types';
 import type { DemoScenario } from '$lib/demo/scenarios';
 
@@ -126,9 +126,11 @@ export function buildSystemPrompt(opts: {
 	contacts: ContactRecord[];
 	isDemo: boolean;
 	scenario: DemoScenario | null;
+	/** Organisation policy; defaults to the demo/production constants. */
+	responseTimeoutSeconds?: number;
 }): string {
 	const { now, snap, contacts, isDemo, scenario } = opts;
-	const timeout = responseTimeoutSeconds(isDemo);
+	const timeout = opts.responseTimeoutSeconds ?? responseTimeoutSeconds(isDemo);
 	const stateBlock = snap
 		? `CURRENT INCIDENT RECORD (source of truth — do not contradict it):\n${JSON.stringify(agentStateSummary(snap, now), null, 1)}`
 		: 'No incident record exists yet. Your first job is to hear what happened and call create_incident.';
@@ -166,15 +168,15 @@ ACTIONS AND ESCALATION
 - When the user says something is already done ("I already moved the food", "doors are shut"), record it: update_action to completed if that action exists, otherwise add_action with status completed, and add_fact for the new situation.
 - When the user asks you to get someone involved ("get maintenance on it", "call the manager"), create or update that contact action with status in_progress in the same turn. What you say must match the record: never say you started a contact while the action is still pending.
 - If asked "what should we do", give the top one or two actions in one sentence each, not a list.
-- SENTINEL has NO messaging, SMS, email or phone integration. Never say you sent, called, messaged or notified anyone. Say "I've logged that maintenance needs to be contacted" or, in demo mode, "I've started a simulated contact with Ko Min."
-- A contact action in progress waits ${timeout} seconds${isDemo ? ' (compressed demo timing)' : ''} for a response; if none arrives, SENTINEL escalates automatically and tells you. Relay escalations in one sentence.
+- Outreach: SENTINEL may send a real SMS, call, email or Slack message when a contact has one set up. Say only what the tool result says: "queued" means not sent yet; "sent" is not "delivered"; if it says no message was sent, say staff need to contact them directly. Never claim you called, messaged or notified anyone unless a tool result or SYSTEM EVENT says so. In demo mode everything is simulated; say so.
+- A contact action in progress waits ${formatDuration(timeout)}${isDemo ? ' (compressed demo timing)' : ''} for a response; if none arrives, SENTINEL escalates automatically and tells you. Relay escalations in one sentence.
 - Record replies from people (maintenance called back) with record_response.
 - Only use names from the directory below or names the user says.
 
 TOOL RESULTS
 - Tool results are the only confirmation that something was recorded. If a tool fails, say briefly that it didn't save and ask for what the error names.
 - Follow any "guidance" field in a tool result.
-- Messages starting "SYSTEM EVENT:" come from SENTINEL itself (timers, simulations). Tell the user briefly; don't treat them as the user's words.
+- Messages starting "SYSTEM EVENT:" come from SENTINEL itself (timers, delivery receipts, acknowledgements, sensors, simulations). Tell the user briefly; don't treat them as the user's words. What a SYSTEM EVENT reports is already recorded: don't call a tool to repeat it (no create_escalation for an escalation it announces). Your very next sentence must relay it, e.g. "No reply from maintenance, so it's been escalated to the operations manager."
 
 CONTEXT
 Current time: ${now.toISOString().slice(0, 16).replace('T', ' ')} UTC.
@@ -206,6 +208,7 @@ export function buildSessionUpdate(opts: {
 	contacts: ContactRecord[];
 	isDemo: boolean;
 	scenario: DemoScenario | null;
+	responseTimeoutSeconds?: number;
 	initial: boolean;
 }) {
 	const tier: ToolTier = opts.snap ? 'response' : 'intake';

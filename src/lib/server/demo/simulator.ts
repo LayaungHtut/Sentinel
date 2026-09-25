@@ -39,6 +39,7 @@ export async function simulate(
 		return executeTool(db, {
 			name: 'record_response',
 			origin: 'demo_simulation',
+			orgId: snap.incident.orgId,
 			incidentId,
 			arguments: {
 				action: target.seq,
@@ -53,6 +54,7 @@ export async function simulate(
 	return executeTool(db, {
 		name: 'resolve_escalation',
 		origin: 'demo_simulation',
+		orgId: snap.incident.orgId,
 		incidentId,
 		arguments: {
 			escalation: esc.seq,

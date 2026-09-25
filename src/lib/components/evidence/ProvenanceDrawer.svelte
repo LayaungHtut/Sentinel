@@ -1,5 +1,15 @@
 <script lang="ts">
-	import { History, ListChecks, MessageSquareText, Quote, TriangleAlert, X } from '@lucide/svelte';
+	import {
+		AudioLines,
+		History,
+		ListChecks,
+		MessageSquareText,
+		Quote,
+		TriangleAlert,
+		X
+	} from '@lucide/svelte';
+	import { page } from '$app/state';
+	import { resolve } from '$app/paths';
 	import EpistemicBadge from './EpistemicBadge.svelte';
 	import { classifyFact, EPISTEMIC_DESCRIPTIONS, formatFactValue } from '$lib/domain/evidence';
 	import { sourceLabel } from '$lib/domain/report';
@@ -21,6 +31,14 @@
 	const byId = $derived(new Map(view.facts.map((f) => [f.id, f])));
 	const fact = $derived(byId.get(factId) ?? null);
 	const cls = $derived(fact ? classifyFact(fact) : null);
+	const canPlayRecording = $derived(
+		['coordinator', 'manager', 'admin'].includes(page.data.user?.role ?? '')
+	);
+	const BASIS: Record<string, string> = {
+		stated: 'Stated directly',
+		inferred: 'Inferred by SENTINEL',
+		observed: 'Measured by a sensor'
+	};
 	const transcript = $derived(
 		fact?.transcriptId ? (view.transcripts.find((t) => t.id === fact.transcriptId) ?? null) : null
 	);
@@ -114,7 +132,7 @@
 				<div>
 					<dt class="mb-0.5 eyebrow text-[10px]">Basis</dt>
 					<dd class="text-ink-100">
-						{fact.basis === 'stated' ? 'Stated directly' : 'Inferred by SENTINEL'}
+						{BASIS[fact.basis] ?? fact.basis}
 					</dd>
 				</div>
 				<div>
@@ -129,6 +147,12 @@
 							>{/if}
 					</dd>
 				</div>
+				{#if fact.sourceRef}
+					<div class="col-span-2">
+						<dt class="mb-0.5 eyebrow text-[10px]">Device / reference</dt>
+						<dd class="mono text-ink-100">{fact.sourceRef}</dd>
+					</div>
+				{/if}
 				{#if fact.confirmationNote}
 					<div class="col-span-2">
 						<dt class="mb-0.5 eyebrow text-[10px]">Confirmation</dt>
@@ -163,12 +187,42 @@
 								>{highlighted.match}</mark
 							>{highlighted.after}”
 						</blockquote>
-						<button
-							class="mt-2 flex items-center gap-1.5 text-[12px] text-voice hover:underline"
-							onclick={() => onShowInConversation(transcript.text)}
-						>
-							<MessageSquareText class="size-3.5" /> Show in conversation
-						</button>
+						{#if transcript.redactedAt}
+							<p class="mt-1 text-[11px] text-ink-500">
+								The original words were redacted; the fact and its audit trail are kept.
+							</p>
+						{/if}
+						<div class="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[12px]">
+							<button
+								class="flex items-center gap-1.5 text-voice hover:underline"
+								onclick={() => onShowInConversation(transcript.text)}
+							>
+								<MessageSquareText class="size-3.5" /> Show in conversation
+							</button>
+							{#if transcript.sttConfidence != null}
+								<span
+									class={transcript.sttConfidence < 0.6 ? 'text-warn' : 'text-ink-400'}
+									title="AssemblyAI speech-recognition confidence for this utterance"
+								>
+									STT confidence {Math.round(
+										transcript.sttConfidence * 100
+									)}%{transcript.sttConfidence < 0.6 ? ' (low; verify)' : ''}
+								</span>
+							{/if}
+							{#if canPlayRecording && transcript.channel === 'voice' && transcript.voiceSessionId}
+								<a
+									class="flex items-center gap-1.5 text-voice hover:underline"
+									href={resolve('/api/voice/sessions/[id]/recording', {
+										id: transcript.voiceSessionId
+									})}
+									target="_blank"
+									rel="noopener noreferrer"
+									data-sveltekit-reload
+								>
+									<AudioLines class="size-3.5" /> Session recording
+								</a>
+							{/if}
+						</div>
 					</figure>
 				{:else if fact.evidenceQuote}
 					<div class="rounded-md border border-warn/40 bg-warn/5 p-3 text-[13px]">
@@ -182,11 +236,13 @@
 					</div>
 				{:else}
 					<p class="text-[13px] text-ink-400">
-						{fact.sourceType === 'operator_entry'
-							? 'Entered manually by an operator. No transcript evidence.'
-							: fact.basis === 'inferred'
-								? 'Inferred by SENTINEL. Nobody said this directly.'
-								: 'No quote was captured for this fact.'}
+						{fact.sourceType === 'sensor'
+							? 'Reported by a connected sensor through the SENTINEL API. Nobody said this.'
+							: fact.sourceType === 'operator_entry'
+								? 'Entered manually by an operator. No transcript evidence.'
+								: fact.basis === 'inferred'
+									? 'Inferred by SENTINEL. Nobody said this directly.'
+									: 'No quote was captured for this fact.'}
 					</p>
 				{/if}
 			</section>

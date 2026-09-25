@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { PGlite } from '@electric-sql/pglite';
 import { PGLiteSocketServer } from '@electric-sql/pglite-socket';
 import { createDb, type DbHandle } from './index';
-import { seedDatabase } from '../demo/seed';
+import { DEMO_ORG_ID, seedDatabase } from '../demo/seed';
 import { executeTool } from '../tools/executor';
 import { loadSnapshot } from '../incidents/repository';
 
@@ -40,6 +40,7 @@ describe('node-postgres driver (DATABASE_URL)', () => {
 		const res = await executeTool(h.db, {
 			name: 'create_incident',
 			origin: 'operator',
+			orgId: DEMO_ORG_ID,
 			arguments: {
 				title: 'Freezer down',
 				type: 'refrigeration_failure',

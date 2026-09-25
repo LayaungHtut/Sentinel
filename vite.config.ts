@@ -1,10 +1,26 @@
 import tailwindcss from '@tailwindcss/vite';
 import { defineConfig } from 'vitest/config';
+import type { Plugin } from 'vite';
 import adapter from '@sveltejs/adapter-node';
 import { sveltekit } from '@sveltejs/kit/vite';
 
+/** Dev server: forward WebSocket upgrades to the voice relay (production does this in server/index.js). */
+const voiceRelayDev: Plugin = {
+	name: 'sentinel-voice-relay',
+	configureServer(server) {
+		server.httpServer?.on('upgrade', (req, socket, head) => {
+			if (!req.url?.startsWith('/api/voice/relay')) return;
+			const relay = (
+				globalThis as { __sentinelRelay?: { handleUpgrade: (...a: unknown[]) => boolean } }
+			).__sentinelRelay;
+			if (!relay?.handleUpgrade(req, socket, head)) socket.destroy();
+		});
+	}
+};
+
 export default defineConfig({
 	plugins: [
+		voiceRelayDev,
 		tailwindcss(),
 		sveltekit({
 			compilerOptions: {

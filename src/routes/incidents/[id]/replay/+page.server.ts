@@ -10,9 +10,9 @@ import { buildReplay } from '$lib/domain/replay';
 import { serialize } from '$lib/domain/view';
 import type { PageServerLoad } from './$types';
 
-export const load: PageServerLoad = async ({ params }) => {
+export const load: PageServerLoad = async ({ params, locals }) => {
 	const db = await getDb();
-	const incident = await findIncidentByIdOrCode(db, params.id.slice(0, 64));
+	const incident = await findIncidentByIdOrCode(db, locals.auth!.orgId, params.id.slice(0, 64));
 	if (!incident) error(404, 'Incident not found');
 	const [snap, calls, report] = await Promise.all([
 		loadSnapshot(db, incident.id),

@@ -55,6 +55,7 @@ function fact(p: Partial<FactRecord>): FactRecord {
 		transcriptId: null,
 		evidenceQuote: null,
 		quoteMatched: null,
+		sourceRef: null,
 		speaker: 'Reporter',
 		observedAt: NOW,
 		confirmedAt: null,
@@ -68,6 +69,7 @@ function fact(p: Partial<FactRecord>): FactRecord {
 function incident(p: Partial<IncidentRecord> = {}): IncidentRecord {
 	return {
 		id: 'i1',
+		orgId: 'org1',
 		code: 'INC-0042',
 		title: 'Refrigeration failure',
 		type: 'refrigeration_failure',
@@ -128,7 +130,11 @@ const contacts: ContactRecord[] = [
 		site: null,
 		organization: 'x',
 		isDemo: true,
-		notificationChannel: 'none'
+		notificationChannel: 'none',
+		orgId: 'org1',
+		phone: null,
+		email: null,
+		onCall: false
 	},
 	{
 		id: 'c2',
@@ -138,7 +144,11 @@ const contacts: ContactRecord[] = [
 		site: 'Yangon Branch',
 		organization: 'x',
 		isDemo: true,
-		notificationChannel: 'none'
+		notificationChannel: 'none',
+		orgId: 'org1',
+		phone: null,
+		email: null,
+		onCall: false
 	},
 	{
 		id: 'c3',
@@ -148,7 +158,11 @@ const contacts: ContactRecord[] = [
 		site: 'Mandalay Branch',
 		organization: 'x',
 		isDemo: true,
-		notificationChannel: 'none'
+		notificationChannel: 'none',
+		orgId: 'org1',
+		phone: null,
+		email: null,
+		onCall: false
 	}
 ];
 

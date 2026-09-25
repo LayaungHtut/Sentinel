@@ -1,6 +1,8 @@
 import { and, asc, desc, eq, inArray, max, sql } from 'drizzle-orm';
 import type { Database } from '../db';
 import * as t from '../db/schema';
+import { appendTimeline } from './audit';
+import { DEMO_ORG_SETTINGS, parseOrgSettings, type OrgSettings } from '$lib/domain/org-settings';
 import type {
 	ActionRecord,
 	ContactRecord,
@@ -48,17 +50,48 @@ export async function getIncident(db: Tx, id: string): Promise<IncidentRecord> {
 	return mapIncident(row);
 }
 
-export async function findIncidentByIdOrCode(db: Tx, ref: string): Promise<IncidentRecord | null> {
+/** Tenant-safe lookup: an incident in another organisation is indistinguishable from a missing one. */
+export async function getIncidentInOrg(db: Tx, orgId: string, id: string): Promise<IncidentRecord> {
+	const incident = await getIncident(db, id);
+	if (incident.orgId !== orgId) throw new NotFoundError(`Incident ${id} not found`);
+	return incident;
+}
+
+export async function findIncidentByIdOrCode(
+	db: Tx,
+	orgId: string,
+	ref: string
+): Promise<IncidentRecord | null> {
 	const [row] = await db
 		.select()
 		.from(t.incidents)
-		.where(sql`${t.incidents.id} = ${ref} or upper(${t.incidents.code}) = upper(${ref})`);
+		.where(
+			and(
+				eq(t.incidents.orgId, orgId),
+				sql`(${t.incidents.id} = ${ref} or upper(${t.incidents.code}) = upper(${ref}))`
+			)
+		);
 	return row ? mapIncident(row) : null;
 }
 
-export async function listContacts(db: Tx): Promise<ContactRecord[]> {
-	const rows = await db.select().from(t.contacts).orderBy(asc(t.contacts.name));
+export async function listContacts(db: Tx, orgId: string): Promise<ContactRecord[]> {
+	const rows = await db
+		.select()
+		.from(t.contacts)
+		.where(eq(t.contacts.orgId, orgId))
+		.orderBy(asc(t.contacts.name));
 	return rows.map(mapContact);
+}
+
+export async function getOrg(db: Tx, orgId: string) {
+	const [org] = await db.select().from(t.organizations).where(eq(t.organizations.id, orgId));
+	if (!org) throw new NotFoundError('Organisation not found');
+	return org;
+}
+
+export async function getOrgSettings(db: Tx, orgId: string): Promise<OrgSettings> {
+	const org = await getOrg(db, orgId);
+	return parseOrgSettings({ ...(org.isDemo ? DEMO_ORG_SETTINGS : {}), ...org.settings });
 }
 
 export async function loadSnapshot(db: Tx, incidentId: string): Promise<IncidentSnapshot> {
@@ -89,13 +122,13 @@ export async function loadSnapshot(db: Tx, incidentId: string): Promise<Incident
 				.select()
 				.from(t.timelineEvents)
 				.where(eq(t.timelineEvents.incidentId, incidentId))
-				.orderBy(asc(t.timelineEvents.occurredAt)),
+				.orderBy(asc(t.timelineEvents.chainSeq)),
 			db
 				.select()
 				.from(t.transcripts)
 				.where(eq(t.transcripts.incidentId, incidentId))
 				.orderBy(asc(t.transcripts.receivedAt)),
-			listContacts(db)
+			listContacts(db, incident.orgId)
 		]);
 	return {
 		incident,
@@ -109,10 +142,11 @@ export async function loadSnapshot(db: Tx, incidentId: string): Promise<Incident
 	};
 }
 
-export async function listIncidents(db: Tx, limit = 50) {
+export async function listIncidents(db: Tx, orgId: string, limit = 50) {
 	const rows = await db
 		.select()
 		.from(t.incidents)
+		.where(eq(t.incidents.orgId, orgId))
 		.orderBy(desc(t.incidents.reportedAt))
 		.limit(limit);
 	if (!rows.length) return [];
@@ -143,10 +177,13 @@ export async function listIncidents(db: Tx, limit = 50) {
 	}));
 }
 
-export async function nextIncidentCode(db: Tx): Promise<string> {
+export async function nextIncidentCode(db: Tx, orgId: string): Promise<string> {
+	// Serialise code allocation per organisation.
+	await db.execute(sql`select pg_advisory_xact_lock(hashtext(${'code:' + orgId}))`);
 	const [row] = await db
 		.select({ n: max(sql<number>`cast(substring(${t.incidents.code} from 5) as integer)`) })
-		.from(t.incidents);
+		.from(t.incidents)
+		.where(eq(t.incidents.orgId, orgId));
 	// Numbering starts at INC-0040 so seeded history precedes the live demo incident.
 	const next = Math.max(Number(row?.n) || 0, 39) + 1;
 	return `INC-${String(next).padStart(4, '0')}`;
@@ -164,11 +201,12 @@ export async function nextSeq(
 	return (row?.n ?? 0) + 1;
 }
 
+/** Every timeline write goes through the tamper-evident hash chain. */
 export async function addTimeline(
 	db: Tx,
-	event: Omit<typeof t.timelineEvents.$inferInsert, 'id'>
+	event: Omit<typeof t.timelineEvents.$inferInsert, 'id' | 'chainSeq' | 'prevHash' | 'hash'>
 ): Promise<void> {
-	await db.insert(t.timelineEvents).values(event);
+	await appendTimeline(db, event);
 }
 
 export async function touchIncident(

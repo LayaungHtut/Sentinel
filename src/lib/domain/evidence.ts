@@ -10,6 +10,7 @@ export function classifyFact(
 ): EpistemicClass {
 	if (fact.verification === 'disputed') return 'disputed';
 	if (fact.verification === 'confirmed') return 'confirmed';
+	if (fact.basis === 'observed') return 'observed';
 	if (fact.basis === 'inferred') return 'inferred';
 	if (fact.certainty === 'approximate') return 'approximate';
 	if (fact.needsVerification) return 'unverified';
@@ -22,7 +23,8 @@ export const EPISTEMIC_LABELS: Record<EpistemicClass, string> = {
 	unverified: 'Unverified',
 	approximate: 'Approximate',
 	inferred: 'Inferred',
-	disputed: 'Disputed'
+	disputed: 'Disputed',
+	observed: 'Sensor reading'
 };
 
 export const EPISTEMIC_DESCRIPTIONS: Record<EpistemicClass, string> = {
@@ -31,7 +33,9 @@ export const EPISTEMIC_DESCRIPTIONS: Record<EpistemicClass, string> = {
 	unverified: 'Stated directly, but a reading or claim that has not been verified.',
 	approximate: 'Stated as an estimate — precision is limited.',
 	inferred: 'Reasoned by SENTINEL from other facts. Not stated by anyone.',
-	disputed: 'Later called into question. Treat with caution.'
+	disputed: 'Later called into question. Treat with caution.',
+	observed:
+		'Measured by an instrument and delivered through the sensor API, not spoken by a person.'
 };
 
 /** Measurement-type facts need verification by default. */

@@ -1,6 +1,6 @@
 /**
- * LIVE browser test: real Chromium + the production VoiceAgent client + the real
- * AssemblyAI Voice Agent API. Chromium's microphone is a WAV file (TTS of the
+ * LIVE browser test: real Chromium + the production VoiceAgent client + the
+ * SENTINEL voice relay + the real AssemblyAI Voice Agent API. Chromium's microphone is a WAV file (TTS of the
  * demo report, padded with silence) via --use-file-for-fake-audio-capture.
  * Billed to your key; never prints it.
  *
@@ -12,6 +12,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import assert from 'node:assert/strict';
+import WebSocket from 'ws';
 
 if (!process.env.ASSEMBLYAI_API_KEY) {
 	console.error('ASSEMBLYAI_API_KEY is not configured.');
@@ -54,14 +55,20 @@ header.writeUInt32LE(body.length, 40);
 const micWav = resolve('.data/voice/browser-mic.wav');
 writeFileSync(micWav, Buffer.concat([header, body]));
 
-// ---- server in-process
+// ---- server in-process (voice relay on the same HTTP server)
 process.env.DATABASE_URL = '';
 process.env.PGLITE_DATA_DIR = '.data/live-browser-db';
+process.env.DEMO_LOGIN_ENABLED = 'true';
+process.env.ORIGIN = 'http://localhost:4999';
 rmSync(process.env.PGLITE_DATA_DIR, { recursive: true, force: true });
 const { handler } = await import('../build/handler.js');
 const server = http.createServer(handler);
+server.on('upgrade', (req, socket, head) => {
+	if (!globalThis.__sentinelRelay?.handleUpgrade(req, socket, head)) socket.destroy();
+});
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}`;
+const PUBLIC = 'http://localhost:4999';
 
 const { chromium } = await import('playwright');
 const browser = await chromium.launch({
@@ -73,35 +80,70 @@ const browser = await chromium.launch({
 	]
 });
 const context = await browser.newContext({ viewport: { width: 1600, height: 1000 } });
-await context.grantPermissions(['microphone'], { origin: 'http://localhost:4999' });
-await context.route('http://localhost:4999/**', async (route) => {
+await context.grantPermissions(['microphone'], { origin: PUBLIC });
+await context.route(`${PUBLIC}/**`, async (route) => {
 	const req = route.request();
 	const url = new URL(req.url());
 	const res = await fetch(base + url.pathname + url.search, {
 		method: req.method(),
 		headers: req.headers(),
-		body: ['GET', 'HEAD'].includes(req.method()) ? undefined : req.postDataBuffer()
+		body: ['GET', 'HEAD'].includes(req.method()) ? undefined : req.postDataBuffer(),
+		redirect: 'manual'
 	});
-	await route.fulfill({
-		status: res.status,
-		headers: Object.fromEntries(res.headers),
-		body: Buffer.from(await res.arrayBuffer())
+	const headers = Object.fromEntries(res.headers);
+	const cookies = res.headers.getSetCookie?.() ?? [];
+	if (cookies.length) headers['set-cookie'] = cookies.join('\n');
+	const location = res.headers.get('location');
+	if (res.status >= 300 && res.status < 400 && location && req.isNavigationRequest()) {
+		// Playwright does not route the follow-up of a fulfilled redirect: navigate client-side.
+		delete headers.location;
+		delete headers['content-length'];
+		headers['content-type'] = 'text/html';
+		const target = JSON.stringify(new URL(location, PUBLIC).href);
+		return route.fulfill({
+			status: 200,
+			headers,
+			body: `<script>location.replace(${target})</script>`
+		});
+	}
+	await route.fulfill({ status: res.status, headers, body: Buffer.from(await res.arrayBuffer()) });
+});
+// Bridge the browser's relay WebSocket to the in-process server (which talks to AssemblyAI).
+// (Playwright emits no page 'websocket' events for routed sockets, so frames are counted here.)
+const relayUrls = [];
+const relayFrames = [];
+let bridge = null;
+await context.routeWebSocket(/\/api\/voice\/relay/, async (route) => {
+	const url = new URL(route.url());
+	const cookie = (await context.cookies(PUBLIC)).map((c) => `${c.name}=${c.value}`).join('; ');
+	const upstream = new WebSocket(`${base.replace('http', 'ws')}${url.pathname}${url.search}`, {
+		headers: { cookie, origin: PUBLIC }
 	});
+	relayUrls.push(url.pathname);
+	bridge = { upstream, route };
+	const early = [];
+	route.onMessage((m) =>
+		upstream.readyState === WebSocket.OPEN ? upstream.send(m) : early.push(m)
+	);
+	upstream.on('open', () => early.splice(0).forEach((m) => upstream.send(m)));
+	upstream.on('message', (d) => {
+		try {
+			const m = JSON.parse(String(d));
+			relayFrames.push(m.type === 'status' ? `status:${m.state}` : m.type);
+		} catch {
+			/* ignore */
+		}
+		route.send(String(d));
+	});
+	upstream.on('close', (code) =>
+		route.close({ code: code === 1005 || code === 1006 ? 1000 : code }).catch(() => {})
+	);
+	route.onClose(() => upstream.close());
 });
 const page = await context.newPage();
-const wsFrames = { sent: 0, received: [] };
-page.on('websocket', (ws) => {
-	if (!ws.url().startsWith('wss://agents.assemblyai.com')) return;
-	console.log('✓ browser opened', ws.url().replace(/token=[^&]+/, 'token=<temp>'));
-	ws.on('framesent', () => wsFrames.sent++);
-	ws.on('framereceived', (f) => {
-		try {
-			wsFrames.received.push(JSON.parse(String(f.payload)).type);
-		} catch {
-			/* binary */
-		}
-	});
-});
+const browserUrls = [];
+page.on('request', (r) => browserUrls.push(r.url()));
+page.on('websocket', (ws) => browserUrls.push(ws.url()));
 const errors = [];
 page.on('pageerror', (e) => errors.push(e.message));
 
@@ -117,9 +159,13 @@ const step = async (name, fn) => {
 	}
 };
 
-await step('start incident in real Chromium (mic = WAV file)', async () => {
-	await page.goto('http://localhost:4999/incidents/new?scenario=refrigeration');
+await step('sign in (demo organisation) and start an incident (mic = WAV file)', async () => {
+	await page.goto(`${PUBLIC}/login`);
+	await page.getByRole('button', { name: 'Continue with demo' }).click();
+	await page.getByText('Turn a messy spoken incident').waitFor();
+	await page.goto(`${PUBLIC}/incidents/new?scenario=refrigeration`);
 	await page.getByRole('button', { name: 'Start incident' }).click();
+	await page.getByRole('button', { name: 'I agree, start voice' }).click();
 	await page
 		.getByRole('status')
 		.getByText(/^(Listening|Speaking|Hearing you|Processing)$/)
@@ -147,7 +193,7 @@ await step('facts are persisted with transcript provenance', async () => {
 	const deadline = Date.now() + 20000;
 	let view;
 	while (Date.now() < deadline) {
-		view = await (await fetch(`${base}/api/incidents/${id}`)).json();
+		view = await page.evaluate(async (u) => (await fetch(u)).json(), `/api/incidents/${id}`);
 		if (view.facts.some((f) => f.key === 'temperature')) break;
 		await new Promise((r) => setTimeout(r, 1000));
 	}
@@ -168,59 +214,48 @@ await step('SENTINEL asks a follow-up question by voice', async () => {
 	await page.waitForTimeout(3000);
 	if (shots) await page.screenshot({ path: `${shots}/live-browser.png`, fullPage: true });
 });
-await step('network drop (DevTools offline 4 s): voice recovers or degrades honestly', async () => {
-	const cdp = await context.newCDPSession(page);
-	const net = (offline) =>
-		cdp.send('Network.emulateNetworkConditions', {
-			offline,
-			latency: 0,
-			downloadThroughput: -1,
-			uploadThroughput: -1
-		});
-	await net(true);
-	await page.waitForTimeout(4000);
-	await net(false);
-	// Either the socket survived, or the client reconnects (new session fallback) or degrades with data preserved.
-	const outcome = await Promise.race([
-		page
+await step(
+	'link to SENTINEL drops: the client opens a new session on the same incident',
+	async () => {
+		const incidentUrl = page.url();
+		const sessionsBefore = relayUrls.length;
+		// Cut the browser's socket to SENTINEL (the server ends that AssemblyAI session).
+		bridge.upstream.terminate();
+		await page
 			.getByText('Voice reconnected with a new session')
-			.waitFor({ timeout: 40000 })
-			.then(() => 'reconnected (new session)'),
-		page
-			.getByText('Voice connection restored.')
-			.waitFor({ timeout: 40000 })
-			.then(() => 'resumed'),
-		page
-			.getByText(/Voice unavailable/)
 			.first()
-			.waitFor({ timeout: 40000 })
-			.then(() => 'degraded (data preserved)'),
-		page
-			.waitForTimeout(12000)
-			.then(async () =>
-				(await page.getByText(/VOICE CONNECTION LOST/i).count())
-					? 'still reconnecting'
-					: 'socket survived'
-			)
-	]);
-	console.log(`   network-drop outcome: ${outcome}`);
-	if (shots)
-		await page.screenshot({ path: `${shots}/live-browser-after-drop.png`, fullPage: true });
-	assert.notEqual(outcome, 'still reconnecting');
-});
+			.waitFor({ timeout: 40000 });
+		assert.ok(relayUrls.length > sessionsBefore, 'no new relay session opened');
+		assert.equal(page.url(), incidentUrl, 'stayed on the same incident');
+		await page
+			.getByRole('status')
+			.getByText(/^(Listening|Speaking|Hearing you|Processing)$/)
+			.waitFor({ timeout: 20000 });
+		if (shots)
+			await page.screenshot({ path: `${shots}/live-browser-after-drop.png`, fullPage: true });
+	}
+);
 await step('End sends session.end and the session closes cleanly', async () => {
 	const end = page.getByRole('button', { name: 'End', exact: true });
 	if (!(await end.count())) throw new Error('no active session to end (voice degraded earlier)');
 	await end.click();
-	await page.getByText('Session ended').waitFor({ timeout: 10000 });
-	assert.ok(wsFrames.received.includes('session.ended'), 'no session.ended frame');
+	await page.getByText('Session ended').first().waitFor({ timeout: 10000 });
+	assert.ok(relayFrames.includes('status:ended'), 'no ended status from the relay');
+	const id = page.url().split('/').pop();
+	const view = await page.evaluate(async (u) => (await fetch(u)).json(), `/api/incidents/${id}`);
+	assert.ok(view.voiceSessions.length >= 2, 'both voice sessions recorded');
 });
 await step('no page errors', async () => assert.deepEqual(errors, []));
+await step('the browser never contacted AssemblyAI or saw the key', async () => {
+	assert.ok(!browserUrls.some((u) => /assemblyai\.com/.test(u)));
+	assert.ok(!browserUrls.some((u) => u.includes(process.env.ASSEMBLYAI_API_KEY)));
+});
 
 console.log(
-	`\nframes: sent=${wsFrames.sent}, received types=${[...new Set(wsFrames.received)].join(',')}`
+	`\nrelay sessions: ${relayUrls.length}; frame types: ${[...new Set(relayFrames)].join(',')}`
 );
 console.log(`${results.filter((r) => r[1]).length}/${results.length} steps passed`);
 await browser.close();
+await globalThis.__sentinelShutdown?.();
 server.close();
-process.exit(0);
+process.exit(results.every((r) => r[1]) ? 0 : 1);

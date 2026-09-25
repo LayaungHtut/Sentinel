@@ -1,31 +1,25 @@
 import { error, json } from '@sveltejs/kit';
 import { getDb } from '$lib/server/db';
-import { idParam, rateLimit } from '$lib/server/http';
-import { getIncident, NotFoundError } from '$lib/server/incidents/repository';
-import { refreshSeverity, runEscalationCheck } from '$lib/server/incidents/engine';
+import { idParam, rateLimit, requireRole } from '$lib/server/http';
+import { getIncidentInOrg, NotFoundError } from '$lib/server/incidents/repository';
+import { escalationSweep } from '$lib/server/jobs/scheduler';
 import type { RequestHandler } from './$types';
 
 /**
- * Evaluate the response-timeout escalation rule. The dashboard calls this on
- * a short interval while an incident is open; the rule itself (and its
- * idempotency) lives server-side.
+ * Manual "check now". The scheduler evaluates response timeouts every few
+ * seconds on its own; this only lets a coordinator trigger it immediately.
  */
 export const POST: RequestHandler = async (event) => {
-	rateLimit(event, 'escalation-check', 120);
+	const auth = requireRole(event, 'coordinator');
+	await rateLimit(event, 'escalation-check', 30);
 	const id = idParam.parse(event.params.id);
 	const db = await getDb();
 	try {
-		await getIncident(db, id);
-		const ctx = { origin: 'system' as const, voiceSessionId: null, now: new Date() };
-		const created = await db.transaction(async (tx) => {
-			const esc = await runEscalationCheck(tx, id, ctx);
-			// Time-based rules (e.g. 2 h above 5 °C) can change severity without new facts.
-			await refreshSeverity(tx, id, ctx);
-			return esc;
-		});
-		return json({ created });
+		await getIncidentInOrg(db, auth.orgId, id);
 	} catch (e) {
-		if (e instanceof NotFoundError) error(404, e.message);
+		if (e instanceof NotFoundError) error(404, 'Incident not found');
 		throw e;
 	}
+	const announced = await escalationSweep(db);
+	return json({ created: announced.filter((a) => a.incidentId === id) });
 };

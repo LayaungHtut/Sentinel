@@ -2,8 +2,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { eq } from 'drizzle-orm';
 import { createDb, type DbHandle } from '../db';
 import * as t from '../db/schema';
-import { executeTool } from './executor';
-import { seedDatabase } from '../demo/seed';
+import { executeTool as runTool, type ExecuteRequest } from './executor';
+import { DEMO_ORG_ID, seedDatabase } from '../demo/seed';
 import { loadSnapshot } from '../incidents/repository';
 import { runEscalationCheck } from '../incidents/engine';
 import { simulate } from '../demo/simulator';
@@ -11,6 +11,12 @@ import { classifyFact } from '$lib/domain/evidence';
 import { buildChecklist } from '$lib/domain/information';
 
 let h: DbHandle;
+
+/** Tool calls in these tests run inside the demo organisation as an administrator. */
+const ADMIN = { userId: 'test-admin', name: 'Test admin', role: 'admin' as const };
+function executeTool(db: DbHandle['db'], req: Omit<ExecuteRequest, 'orgId'> & { orgId?: string }) {
+	return runTool(db, { orgId: DEMO_ORG_ID, actor: ADMIN, ...req });
+}
 
 beforeAll(async () => {
 	h = await createDb({ pgliteDataDir: 'memory://' });
@@ -21,7 +27,7 @@ afterAll(async () => h?.close());
 async function newVoiceSession(isDemo = true) {
 	const [s] = await h.db
 		.insert(t.voiceSessions)
-		.values({ isDemo, status: 'active', startedAt: new Date() })
+		.values({ orgId: DEMO_ORG_ID, isDemo, status: 'active', startedAt: new Date() })
 		.returning();
 	return s.id;
 }

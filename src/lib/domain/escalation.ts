@@ -11,9 +11,13 @@ export function responseTimeoutSeconds(isDemo: boolean): number {
 	return isDemo ? RESPONSE_TIMEOUT_SECONDS.demo : RESPONSE_TIMEOUT_SECONDS.production;
 }
 
-export function responseDueAt(from: Date, isDemo: boolean): Date {
-	return new Date(from.getTime() + responseTimeoutSeconds(isDemo) * 1000);
+/** `timeout` is either the demo flag (legacy default) or an explicit number of seconds from org policy. */
+export function responseDueAt(from: Date, timeout: boolean | number): Date {
+	const seconds = typeof timeout === 'number' ? timeout : responseTimeoutSeconds(timeout);
+	return new Date(from.getTime() + seconds * 1000);
 }
+
+export type EscalationChain = Partial<Record<ContactRole, ContactRole>>;
 
 /** Is this action currently waiting on someone outside the conversation? */
 export function isAwaitingResponse(action: ActionRecord): boolean {
@@ -37,9 +41,11 @@ export interface EscalationTarget {
 export function resolveEscalationTarget(
 	incident: Pick<IncidentRecord, 'type' | 'location'>,
 	fromRole: ContactRole | null,
-	contacts: ContactRecord[]
+	contacts: ContactRecord[],
+	/** Organisation policy; overrides the playbook's default chain per role. */
+	chainOverride: EscalationChain = {}
 ): EscalationTarget {
-	const chain = getPlaybook(incident.type).escalationChain;
+	const chain = { ...getPlaybook(incident.type).escalationChain, ...chainOverride };
 	const role: ContactRole = (fromRole && chain[fromRole]) || 'operations_manager';
 	return { name: findContactName(role, incident.location, contacts), role };
 }
@@ -49,11 +55,27 @@ export function findContactName(
 	location: string | null,
 	contacts: ContactRecord[]
 ): string {
+	const contact = findContact(role, location, contacts);
+	return contact ? contact.name : CONTACT_ROLE_LABELS[role];
+}
+
+/** Best directory match for a role: on-call first, then at the incident site, then any. */
+export function findContact(
+	role: ContactRole,
+	location: string | null,
+	contacts: ContactRecord[]
+): ContactRecord | null {
 	const byRole = contacts.filter((c) => c.role === role);
 	const loc = location?.toLowerCase() ?? '';
-	const atSite = byRole.find((c) => c.site && loc.includes(c.site.toLowerCase().split(' ')[0]));
-	const contact = atSite ?? byRole.find((c) => !c.site) ?? byRole[0];
-	return contact ? contact.name : CONTACT_ROLE_LABELS[role];
+	const atSite = (c: ContactRecord) => !!c.site && loc.includes(c.site.toLowerCase().split(' ')[0]);
+	return (
+		byRole.find((c) => c.onCall && atSite(c)) ??
+		byRole.find((c) => c.onCall) ??
+		byRole.find(atSite) ??
+		byRole.find((c) => !c.site) ??
+		byRole[0] ??
+		null
+	);
 }
 
 export interface TimeoutEscalation {
@@ -71,7 +93,8 @@ export function evaluateResponseTimeouts(
 	actions: ActionRecord[],
 	escalations: EscalationRecord[],
 	contacts: ContactRecord[],
-	now: Date = new Date()
+	now: Date = new Date(),
+	chainOverride: EscalationChain = {}
 ): TimeoutEscalation[] {
 	if (incident.status === 'resolved' || incident.status === 'closed') return [];
 	const escalatedActionIds = new Set(escalations.map((e) => e.actionId).filter(Boolean));
@@ -91,7 +114,7 @@ export function evaluateResponseTimeouts(
 				(action.contactRole ? CONTACT_ROLE_LABELS[action.contactRole] : 'contact');
 			return {
 				action,
-				target: resolveEscalationTarget(incident, action.contactRole, contacts),
+				target: resolveEscalationTarget(incident, action.contactRole, contacts, chainOverride),
 				reason: `No response from ${who} after ${formatDuration(waitedSec)} on “${action.title}”`
 			};
 		});

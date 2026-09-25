@@ -2,33 +2,44 @@
  * LIVE voice evaluation against the real AssemblyAI Voice Agent API.
  * Uses your ASSEMBLYAI_API_KEY (billed). Never prints the key.
  *
- * For each scenario in tests/voice/*.json:
- *   - serves the production build in-process (real SENTINEL server + fresh DB),
- *   - starts a voice session via /api/voice/session (real temp token + config),
- *   - synthesises each user turn with Windows SAPI TTS to 24 kHz PCM16 and
- *     streams it in real time as microphone audio (AssemblyAI STT + turn
- *     detection + LLM + TTS + tool calling are all real),
- *   - bridges tool.call → /api/tools → tool.result exactly like the browser client,
+ * Exercises the production path end to end. For each scenario in tests/voice/*.json:
+ *   - serves the production build in-process (real SENTINEL server, fresh DB,
+ *     scheduler running) and signs in to the fictional demo organisation,
+ *   - registers a voice session (POST /api/voice/session) and opens the
+ *     SENTINEL voice relay WebSocket exactly like the browser does,
+ *   - streams each user turn as 24 kHz PCM16 microphone audio in real time:
+ *     a recorded WAV when the turn has `"audio": "path.wav"`, otherwise
+ *     synthesised speech (Windows SAPI, or espeak-ng + sox on Linux),
+ *   - the server relays to AssemblyAI, executes tools, persists transcripts and
+ *     fires escalation timers; this script only speaks and listens,
  *   - evaluates the resulting database state against the scenario expectations.
  *
  * Usage:
  *   npm run build
- *   node --env-file=.env scripts/live-voice.mjs [scenario-id ...] [--runs N]
- * Results: .data/voice-results/<timestamp>.json (+ console summary)
+ *   node --env-file=.env scripts/live-voice.mjs [scenario-id ...] [--runs N] [--min-pass-rate 0.8]
+ * Results: .data/voice-results/<timestamp>.json (+ console summary). Exit code 1
+ * when the pass rate is below --min-pass-rate (default: report only).
  */
 import http from 'node:http';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import WebSocket from 'ws';
 
 if (!process.env.ASSEMBLYAI_API_KEY) {
 	console.error('ASSEMBLYAI_API_KEY is not configured (run with --env-file=.env).');
 	process.exit(1);
 }
 const args = process.argv.slice(2);
-const runsIdx = args.indexOf('--runs');
-const runs = runsIdx >= 0 ? Number(args[runsIdx + 1]) : 1;
-const wanted = args.filter((a, i) => !a.startsWith('--') && !(runsIdx >= 0 && i === runsIdx + 1));
+const flag = (name) => {
+	const i = args.findIndex((a) => a === name || a.startsWith(`${name}=`));
+	if (i < 0) return undefined;
+	return args[i].includes('=') ? args[i].split('=')[1] : args[i + 1];
+};
+const runs = Number(flag('--runs') ?? 1);
+const minPassRate = flag('--min-pass-rate') !== undefined ? Number(flag('--min-pass-rate')) : null;
+const flagValues = new Set([flag('--runs'), flag('--min-pass-rate')].filter(Boolean));
+const wanted = args.filter((a) => !a.startsWith('--') && !flagValues.has(a));
 const scenarios = readdirSync('tests/voice')
 	.filter((f) => f.endsWith('.json'))
 	.map((f) => JSON.parse(readFileSync(`tests/voice/${f}`, 'utf8')))
@@ -36,36 +47,81 @@ const scenarios = readdirSync('tests/voice')
 
 process.env.DATABASE_URL = '';
 process.env.PGLITE_DATA_DIR = '.data/live-voice-db';
+process.env.DEMO_LOGIN_ENABLED = 'true';
+process.env.SCHEDULER_ENABLED = 'true';
 rmSync(process.env.PGLITE_DATA_DIR, { recursive: true, force: true });
-const { handler } = await import('../build/handler.js');
-const server = http.createServer(handler);
+// Listen first so ORIGIN (read when the handler loads) matches this server.
+let handler;
+const server = http.createServer((req, res) => handler(req, res));
+server.on('upgrade', (req, socket, head) => {
+	if (!globalThis.__sentinelRelay?.handleUpgrade(req, socket, head)) socket.destroy();
+});
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}`;
+process.env.ORIGIN = base;
+({ handler } = await import('../build/handler.js'));
+
+// Sign in to the fictional demo organisation (opt-in demo login).
+const login = await fetch(`${base}/login?/demo`, {
+	method: 'POST',
+	headers: { origin: base, 'content-type': 'application/x-www-form-urlencoded' },
+	body: '',
+	redirect: 'manual'
+});
+const cookie = (login.headers.getSetCookie?.() ?? [])
+	.map((c) => c.split(';')[0])
+	.find((c) => c.startsWith('sentinel_session='));
+if (!cookie) {
+	console.error(`Demo sign-in failed (${login.status}).`);
+	process.exit(1);
+}
 const post = async (path, body) => {
 	const res = await fetch(base + path, {
 		method: 'POST',
-		headers: { 'content-type': 'application/json' },
+		headers: { 'content-type': 'application/json', cookie },
 		body: JSON.stringify(body ?? {})
 	});
 	return { status: res.status, body: await res.json().catch(() => null) };
 };
-const get = async (path) => (await fetch(base + path)).json();
+const get = async (path) => (await fetch(base + path, { headers: { cookie } })).json();
 
-// ---------------------------------------------------------------- TTS cache
+// ---------------------------------------------------------------- audio
 mkdirSync('.data/voice/tts', { recursive: true });
-function speech(text) {
-	const file = `.data/voice/tts/${createHash('sha1').update(text).digest('hex').slice(0, 16)}.wav`;
-	if (!existsSync(file)) {
-		const ps = `Add-Type -AssemblyName System.Speech;
-$f = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(24000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono);
-$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.SetOutputToWaveFile('${file.replace(/'/g, "''")}', $f);
-$s.Speak([Console]::In.ReadToEnd()); $s.Dispose()`;
-		execFileSync('powershell.exe', ['-NoProfile', '-Command', ps], { input: text });
-	}
+/** PCM16 samples from a WAV file; must be 24 kHz mono 16-bit. */
+function wavPcm(file) {
 	const buf = readFileSync(file);
+	const fmt = buf.indexOf('fmt ', 12);
+	const channels = buf.readUInt16LE(fmt + 10);
+	const rate = buf.readUInt32LE(fmt + 12);
+	const bits = buf.readUInt16LE(fmt + 22);
+	if (channels !== 1 || rate !== 24000 || bits !== 16) {
+		throw new Error(
+			`${file}: need 24 kHz mono 16-bit PCM (got ${rate} Hz, ${channels} ch, ${bits}-bit)`
+		);
+	}
 	const at = buf.indexOf('data', 12);
 	return buf.subarray(at + 8, at + 8 + buf.readUInt32LE(at + 4));
 }
+function speech(text) {
+	const file = `.data/voice/tts/${createHash('sha1').update(text).digest('hex').slice(0, 16)}.wav`;
+	if (!existsSync(file)) {
+		if (process.platform === 'win32') {
+			const ps = `Add-Type -AssemblyName System.Speech;
+$f = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(24000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono);
+$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.SetOutputToWaveFile('${file.replace(/'/g, "''")}', $f);
+$s.Speak([Console]::In.ReadToEnd()); $s.Dispose()`;
+			execFileSync('powershell.exe', ['-NoProfile', '-Command', ps], { input: text });
+		} else {
+			// Linux/macOS: espeak-ng, then sox resamples to 24 kHz mono PCM16.
+			const raw = `${file}.raw.wav`;
+			execFileSync('espeak-ng', ['-w', raw, '--stdin'], { input: text });
+			execFileSync('sox', [raw, '-r', '24000', '-c', '1', '-b', '16', file]);
+			rmSync(raw, { force: true });
+		}
+	}
+	return wavPcm(file);
+}
+const turnPcm = (turn) => (turn.audio ? wavPcm(turn.audio) : speech(turn.say));
 
 // ---------------------------------------------------------------- one run
 async function runScenario(sc) {
@@ -90,20 +146,21 @@ async function runScenario(sc) {
 	};
 	const step = (k, ok) => (res.steps[k] = res.steps[k] === false ? false : ok);
 
-	const start = await post('/api/voice/session', { scenario: 'refrigeration' });
+	const start = await post('/api/voice/session', { scenario: 'refrigeration', consent: true });
 	step('authentication', start.status === 200);
 	if (start.status !== 200) {
 		res.errors.push(`voice session: ${start.status} ${start.body?.message}`);
 		return res;
 	}
-	const { voiceSessionId, token, wsUrl, sessionUpdate } = start.body;
-	const turnAudio = sc.turns.map((t) => speech(t.say));
+	const { relayPath } = start.body;
+	const turnAudio = sc.turns.map(turnPcm);
 
-	const ws = new WebSocket(`${wsUrl}?token=${encodeURIComponent(token)}`);
+	const ws = new WebSocket(`${base.replace('http', 'ws')}${relayPath}`, {
+		headers: { cookie, origin: base }
+	});
 	const send = (o) => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(o));
 	let ready = false;
 	let lastEvent = null;
-	let pending = [];
 	let inflight = 0;
 	let turn = -1;
 	let queue = Buffer.alloc(0);
@@ -129,14 +186,14 @@ async function runScenario(sc) {
 			queue = queue.subarray(CHUNK);
 			if (chunk.length < CHUNK) chunk = Buffer.concat([chunk, Buffer.alloc(CHUNK - chunk.length)]);
 		}
-		send({ type: 'input.audio', audio: chunk.toString('base64') });
+		send({ type: 'audio', audio: chunk.toString('base64') });
 		sentAudio = true;
 	}, 50);
 
 	const speakTurn = (i) => {
 		turn = i;
 		log(
-			`🎙 USER (streamed TTS audio, ${(turnAudio[i].length / 48000).toFixed(1)}s): ${sc.turns[i].say}`
+			`🎙 USER (${sc.turns[i].audio ? 'recorded' : 'synthesised'} audio, ${(turnAudio[i].length / 48000).toFixed(1)}s): ${sc.turns[i].say}`
 		);
 		queue = turnAudio[i];
 		lastEvent = 'user.audio';
@@ -149,15 +206,14 @@ async function runScenario(sc) {
 	const finish = () => {
 		if (ended) return;
 		ended = true;
-		log('→ session.end');
-		send({ type: 'session.end' });
-		setTimeout(resolveDone, 4000);
+		log('→ end');
+		send({ type: 'end' });
+		setTimeout(resolveDone, 5000);
 	};
 	const scheduleNext = () => {
 		clearTimeout(quietTimer);
 		quietTimer = setTimeout(() => {
-			if (lastEvent !== 'reply.done' || inflight || pending.length || queue.length)
-				return scheduleNext();
+			if (lastEvent !== 'reply.done' || inflight || queue.length) return scheduleNext();
 			const next = turn + 1;
 			if (next < sc.turns.length) {
 				if (sc.turns[next].bargeIn) {
@@ -179,57 +235,47 @@ async function runScenario(sc) {
 		}, 3000);
 	};
 
-	const flush = () => {
-		if (lastEvent !== 'reply.done' || !pending.length) return;
-		for (const p of pending)
-			send({
-				type: 'tool.result',
-				call_id: p.callId,
-				result: JSON.stringify(p.forAgent),
-				is_error: !p.ok
-			});
-		pending = [];
-	};
-	let cfgTimer = null;
-	const refreshConfig = () => {
-		clearTimeout(cfgTimer);
-		cfgTimer = setTimeout(async () => {
-			const { sessionUpdate: su } = await get(`/api/voice/session/${voiceSessionId}/config`);
-			send({ type: 'session.update', session: su });
-		}, 600);
-	};
-
-	// Dashboard-equivalent escalation tick.
-	const escTick = setInterval(async () => {
-		if (!incidentId || escalated) return;
-		const r = await post(`/api/incidents/${incidentId}/escalation-check`);
-		for (const c of r.body?.created ?? []) {
-			escalated = true;
-			escalationAt = Date.now();
-			const text = `${c.reason}. Escalated to ${c.target}${c.simulated ? ' (demo simulation, no real message sent)' : ''}.`;
-			log(`⚠ SYSTEM EVENT → agent: ${text}`);
-			send({ type: 'conversation.message', role: 'system', content: `SYSTEM EVENT: ${text}` });
-			send({
-				type: 'reply.create',
-				instructions: `Briefly tell the user this SENTINEL update in one or two short sentences, then ask if they want to do anything about it: ${text}`
-			});
-			lastEvent = 'reply.create';
-			scheduleNext();
-		}
-	}, 1000);
-
-	ws.onopen = () => send({ type: 'session.update', session: sessionUpdate });
-	ws.onmessage = async (ev) => {
-		const m = JSON.parse(ev.data);
+	ws.on('message', (raw) => {
+		const m = JSON.parse(String(raw));
 		switch (m.type) {
-			case 'session.ready':
-				ready = true;
-				step('session', true);
-				log(`✓ session.ready (voice ${m.config?.output?.voice ?? '?'})`);
-				await post(`/api/voice/session/${voiceSessionId}/lifecycle`, {
-					event: 'ready',
-					providerSessionId: m.session_id
-				});
+			case 'status':
+				if (m.state === 'ready' || m.state === 'restored') {
+					ready = true;
+					step('session', true);
+					log(`✓ relay ready (${m.state})`);
+				} else if (m.state === 'error') {
+					res.errors.push(`relay error: ${m.message}`);
+					log(`✗ relay error: ${m.message}`);
+				} else if (m.state === 'busy' || m.state === 'reconnecting') {
+					res.errors.push(`relay ${m.state}`);
+					log(`⚠ relay ${m.state}`);
+				} else if (m.state === 'ended') {
+					step('termination', true);
+					log('✓ session ended');
+					resolveDone();
+				}
+				break;
+			case 'incident':
+				incidentId = m.incidentId;
+				break;
+			case 'system':
+				// Escalations and other SENTINEL events, delivered by the server's scheduler.
+				if (/escalat/i.test(m.text)) {
+					escalated = true;
+					escalationAt = Date.now();
+				}
+				log(`⚠ SYSTEM EVENT → agent: ${m.text}`);
+				scheduleNext();
+				break;
+			case 'tool':
+				if (m.state === 'running') {
+					inflight++;
+					break;
+				}
+				inflight = Math.max(0, inflight - 1);
+				res.tools.push({ name: m.name, ok: m.state === 'ok', message: m.message });
+				step('toolCall', true);
+				log(`⚙ ${m.name} ${m.state === 'ok' ? '✓' : '✗'} ${m.message}`);
 				break;
 			case 'input.speech.started':
 				step('speechDetected', true);
@@ -238,11 +284,6 @@ async function runScenario(sc) {
 				step('transcription', !!m.text);
 				res.userTranscripts.push(m.text);
 				log(`   STT: “${m.text}”`);
-				await post(`/api/voice/session/${voiceSessionId}/transcripts`, {
-					speaker: 'user',
-					text: m.text,
-					channel: 'voice'
-				});
 				break;
 			case 'reply.started':
 				lastEvent = m.type;
@@ -273,12 +314,6 @@ async function runScenario(sc) {
 			case 'transcript.agent':
 				res.agentLines.push({ text: m.text, interrupted: !!m.interrupted, at: Date.now() - t0 });
 				log(`🔊 SENTINEL${m.interrupted ? ' [INTERRUPTED]' : ''}: ${m.text}`);
-				await post(`/api/voice/session/${voiceSessionId}/transcripts`, {
-					speaker: 'agent',
-					text: m.text,
-					channel: 'voice',
-					interrupted: !!m.interrupted
-				});
 				break;
 			case 'reply.done':
 				lastEvent = m.type;
@@ -291,59 +326,23 @@ async function runScenario(sc) {
 				}
 				if (m.status === 'interrupted') {
 					res.interruptedReplies++;
-					pending = [];
 					log('   reply.done status=interrupted');
 				}
-				flush();
 				scheduleNext();
 				break;
-			case 'tool.call': {
-				inflight++;
-				const r = await post(`/api/tools/${m.name}`, {
-					voiceSessionId,
-					callId: m.call_id,
-					arguments: m.arguments
-				});
-				inflight--;
-				const ok = !!r.body?.ok;
-				if (r.body?.incidentId) incidentId = r.body.incidentId;
-				res.tools.push({
-					name: m.name,
-					ok,
-					args: m.arguments,
-					message: ok ? r.body.message : r.body?.error
-				});
-				step('toolCall', true);
-				log(`⚙ ${m.name} ${ok ? '✓' : '✗'} ${ok ? r.body.message : r.body?.error}`);
-				const forAgent = ok
-					? { ok: true, message: r.body.message, guidance: r.body.guidance, ...(r.body.data ?? {}) }
-					: { ok: false, error: r.body?.error };
-				pending.push({ callId: m.call_id, ok, forAgent });
-				flush();
-				if (ok) refreshConfig();
-				break;
-			}
-			case 'session.error':
-				res.errors.push(`${m.code}: ${m.message}`);
-				log(`✗ session.error ${m.code}: ${m.message}`);
-				break;
-			case 'session.ended':
-				step('termination', true);
-				log(`✓ session.ended (${m.session_duration_seconds}s)`);
-				await post(`/api/voice/session/${voiceSessionId}/lifecycle`, { event: 'ended' });
-				resolveDone();
-				break;
 		}
-	};
-	ws.onclose = (ev) => {
+	});
+	ws.on('close', (code) => {
 		if (!ended) {
-			res.errors.push(
-				`socket closed unexpectedly (code ${ev.code}${ev.reason ? `: ${ev.reason}` : ''})`
-			);
-			log(`✗ socket closed unexpectedly code=${ev.code} ${ev.reason ?? ''}`);
+			res.errors.push(`socket closed unexpectedly (code ${code})`);
+			log(`✗ socket closed unexpectedly code=${code}`);
 		}
 		resolveDone();
-	};
+	});
+	ws.on('error', (e) => {
+		res.errors.push(`socket error: ${e.message}`);
+		resolveDone();
+	});
 	scheduleNext(); // after greeting
 	const hardStop = setTimeout(() => {
 		res.errors.push('scenario timeout');
@@ -352,7 +351,6 @@ async function runScenario(sc) {
 	await done;
 	clearTimeout(hardStop);
 	clearInterval(pump);
-	clearInterval(escTick);
 	clearTimeout(quietTimer);
 	step('microphoneAudio', sentAudio);
 	res.durationSec = Math.round((Date.now() - t0) / 1000);
@@ -537,5 +535,13 @@ for (const r of all)
 	console.log(
 		`${r.checks.every((c) => c.ok) ? 'PASS' : 'FAIL'}  ${r.scenario} run ${r.run}  (${r.durationSec}s, tools: ${r.tools.map((t) => t.name + (t.ok ? '' : '✗')).join(',')})`
 	);
+const passed = all.filter((r) => r.checks.length && r.checks.every((c) => c.ok)).length;
+const rate = all.length ? passed / all.length : 0;
+console.log(`\nPass rate: ${passed}/${all.length} (${Math.round(rate * 100)}%)`);
+await globalThis.__sentinelShutdown?.();
 server.close();
+if (minPassRate !== null && rate < minPassRate) {
+	console.error(`Below the required pass rate of ${Math.round(minPassRate * 100)}%.`);
+	process.exit(1);
+}
 process.exit(0);

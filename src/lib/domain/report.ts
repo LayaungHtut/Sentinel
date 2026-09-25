@@ -57,6 +57,8 @@ export interface IncidentReport {
 	/** Stated but not independently verified, or disputed. */
 	unverifiedFacts: ReportFact[];
 	inferredFacts: ReportFact[];
+	/** Instrument readings delivered by the sensor API. */
+	observedFacts: ReportFact[];
 	unknowns: { label: string; question: string; state: string; note: string | null }[];
 	actionsTaken: ReportAction[];
 	outstandingActions: ReportAction[];
@@ -101,7 +103,8 @@ const SOURCE_LABELS: Record<SourceType, string> = {
 	operator_entry: 'Operator entry',
 	agent_inference: 'SENTINEL inference',
 	system: 'System',
-	demo_simulation: 'Demo simulation'
+	demo_simulation: 'Demo simulation',
+	sensor: 'Sensor API'
 };
 
 export function sourceLabel(source: SourceType): string {
@@ -198,6 +201,7 @@ export function buildReport(snapshot: IncidentSnapshot, now: Date = new Date()):
 		approximateFacts: bucket(['approximate']),
 		unverifiedFacts: bucket(['unverified', 'disputed']),
 		inferredFacts: bucket(['inferred']),
+		observedFacts: bucket(['observed']),
 		unknowns,
 		actionsTaken,
 		outstandingActions,
@@ -357,6 +361,7 @@ export function renderReportMarkdown(r: IncidentReport): string {
 	section('Approximate Facts', r.approximateFacts.map(factLine), 'None.');
 	section('Unverified Facts', r.unverifiedFacts.map(factLine), 'None.');
 	section('Inferred (not stated by anyone)', r.inferredFacts.map(factLine), 'None.');
+	section('Sensor Readings', r.observedFacts.map(factLine), 'None.');
 	section(
 		'Unknown Information',
 		r.unknowns.map((u) => `- **${u.label}:** ${u.state}${u.note ? ` — ${u.note}` : ''}`),

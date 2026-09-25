@@ -1,30 +1,75 @@
 import { error, json, type RequestEvent } from '@sveltejs/kit';
 import { z } from 'zod';
+import { sql } from 'drizzle-orm';
+import { getDb } from './db';
+import { rateLimits } from './db/schema';
+import { atLeast, type AuthContext } from './auth';
+import { log } from './observability';
+import type { UserRole } from '$lib/domain/types';
+
+/** RATE_LIMIT_SCALE multiplies every limit (e.g. 0.5 to tighten, 10 for load tests). */
+function limitScale(): number {
+	const v = Number(process.env.RATE_LIMIT_SCALE ?? 1);
+	return Number.isFinite(v) && v > 0 ? v : 1;
+}
 
 /**
- * Fixed-window in-memory rate limiter. Adequate for a single-process local
- * deployment; swap for a shared store if SENTINEL is ever horizontally scaled.
+ * Fixed-window rate limiter backed by Postgres, so every app instance shares
+ * the same counters. Keyed by user when signed in, otherwise by client IP.
+ * If the database is unreachable the limiter fails open (logged), rather than
+ * taking the whole API down with it.
  */
-const buckets = new Map<string, { count: number; resetAt: number }>();
-
-export function rateLimit(event: RequestEvent, name: string, limit: number, windowMs = 60_000) {
-	let ip = 'unknown';
-	try {
-		ip = event.getClientAddress();
-	} catch {
-		/* not available in some adapters/tests */
+export async function rateLimit(
+	event: RequestEvent,
+	name: string,
+	limit: number,
+	windowMs = 60_000
+) {
+	let who = event.locals.auth?.userId;
+	if (!who) {
+		try {
+			who = event.getClientAddress();
+		} catch {
+			who = 'unknown';
+		}
 	}
-	const key = `${name}:${ip}`;
-	const now = Date.now();
-	const bucket = buckets.get(key);
-	if (!bucket || bucket.resetAt <= now) {
-		buckets.set(key, { count: 1, resetAt: now + windowMs });
+	const key = `${name}:${who}`;
+	const windowStart = new Date(Math.floor(Date.now() / windowMs) * windowMs);
+	let count: number;
+	try {
+		const db = await getDb();
+		const [row] = await db
+			.insert(rateLimits)
+			.values({ key, windowStart, count: 1 })
+			.onConflictDoUpdate({
+				target: rateLimits.key,
+				set: {
+					count: sql`case when ${rateLimits.windowStart} = ${windowStart} then ${rateLimits.count} + 1 else 1 end`,
+					windowStart
+				}
+			})
+			.returning({ count: rateLimits.count });
+		count = row.count;
+	} catch (e) {
+		log.warn('rate limiter unavailable', { err: e });
 		return;
 	}
-	bucket.count++;
-	if (bucket.count > limit) {
-		error(429, `Too many requests. Try again in ${Math.ceil((bucket.resetAt - now) / 1000)}s.`);
+	if (count > limit * limitScale()) {
+		const retry = Math.ceil((windowStart.getTime() + windowMs - Date.now()) / 1000);
+		error(429, `Too many requests. Try again in ${retry}s.`);
 	}
+}
+
+/** Require a signed-in user with at least `min` role (401/403 otherwise). */
+export function requireRole(event: RequestEvent, min: UserRole): AuthContext {
+	const auth = event.locals.auth;
+	if (!auth) error(401, 'Sign in required.');
+	if (!atLeast(auth.role, min)) error(403, `This needs the ${min} role or higher.`);
+	return auth;
+}
+
+export function actorOf(auth: AuthContext) {
+	return { userId: auth.userId, name: auth.userName, role: auth.role };
 }
 
 /** Parse and validate a JSON body; 400 with field errors on failure. */

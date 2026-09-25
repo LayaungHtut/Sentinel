@@ -40,7 +40,8 @@ export const EPISTEMIC_TONE: Record<
 	unverified: { text: 'text-warn', chip: 'bg-warn/10 text-warn border-warn/40', symbol: '⚠' },
 	approximate: { text: 'text-warn', chip: 'bg-warn/10 text-warn border-warn/40', symbol: '≈' },
 	inferred: { text: 'text-info', chip: 'bg-info/10 text-info border-info/40', symbol: '◇' },
-	disputed: { text: 'text-crit', chip: 'bg-crit/10 text-crit border-crit/40', symbol: '!' }
+	disputed: { text: 'text-crit', chip: 'bg-crit/10 text-crit border-crit/40', symbol: '!' },
+	observed: { text: 'text-info', chip: 'bg-info/10 text-info border-info/40', symbol: '◉' }
 };
 
 export const ACTION_TONE: Record<ActionStatus, string> = {

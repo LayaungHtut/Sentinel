@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run check
+      # Unit + integration tests (embedded PostgreSQL; AssemblyAI and Twilio are mocked).
+      - run: npm test
+      - run: npx playwright install --with-deps chromium
+      # Browser end-to-end against an in-process build with a mock voice agent.
+      - run: npm run test:e2e
+      - name: Secret scan of the client bundle
+        run: |
+          if grep -rE "ASSEMBLYAI_API_KEY|TWILIO_AUTH_TOKEN|DATA_ENCRYPTION_KEY" build/client; then
+            echo "Server secret names found in the client bundle" && exit 1
+          fi
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t sentinel:ci .

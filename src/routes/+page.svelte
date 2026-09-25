@@ -15,6 +15,7 @@
 		Workflow
 	} from '@lucide/svelte';
 	import Brand from '$lib/components/dashboard/Brand.svelte';
+	import UserMenu from '$lib/components/ui/UserMenu.svelte';
 	import SeverityBadge from '$lib/components/incident/SeverityBadge.svelte';
 	import StatusBadge from '$lib/components/incident/StatusBadge.svelte';
 	import { DEMO_SCENARIOS } from '$lib/demo/scenarios';
@@ -61,6 +62,7 @@
 					? `PostgreSQL (${data.dbDriver === 'pglite' ? 'embedded' : 'server'})`
 					: 'Database offline'}
 			</span>
+			<UserMenu />
 		</div>
 	</header>
 

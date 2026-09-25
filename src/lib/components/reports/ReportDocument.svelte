@@ -150,6 +150,12 @@
 			{@render factTable(report.inferredFacts, 'None.')}
 		</section>
 	{/if}
+	{#if report.observedFacts?.length}
+		<section>
+			<h2 class="mb-2 eyebrow">Sensor readings</h2>
+			{@render factTable(report.observedFacts, 'None.')}
+		</section>
+	{/if}
 
 	<section>
 		<h2 class="mb-2 eyebrow">Unknown information</h2>

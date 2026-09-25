@@ -42,7 +42,7 @@
 		history: TranscriptView[];
 		sessions: IncidentView['voiceSessions'];
 		highlightText: string | null;
-		onStart: () => void;
+		onStart: (consent?: boolean) => void;
 	} = $props();
 
 	let typed = $state('');
@@ -61,7 +61,7 @@
 		idle: { label: 'Idle', hint: 'Voice is off.', tone: 'text-ink-400', icon: MicOff },
 		connecting: {
 			label: 'Connecting',
-			hint: 'Opening a secure session with AssemblyAI…',
+			hint: 'Opening a secure voice session through SENTINEL…',
 			tone: 'text-ink-300',
 			icon: LoaderCircle
 		},
@@ -124,6 +124,7 @@
 		unsupported: 'Browser not supported',
 		mic_failed: 'Microphone could not start',
 		not_configured: 'Voice not configured',
+		quota: 'Voice limit reached',
 		voice: 'Voice unavailable'
 	};
 	const ERROR_HELP: Record<string, string> = {
@@ -136,6 +137,8 @@
 		unsupported: 'Use a recent Chrome or Edge.',
 		mic_failed: 'Close other apps using the microphone, then try again.',
 		not_configured: 'Set ASSEMBLYAI_API_KEY on the server.',
+		quota:
+			"Your organisation's voice limit is reached (concurrent sessions or daily minutes). An administrator can change it in Settings.",
 		voice: 'Your incident data is safe. Continue with the manual controls or try again.'
 	};
 
@@ -297,7 +300,7 @@
 			{:else if incidentClosed}
 				<p class="text-[12px] text-ink-400">Incident closed.</p>
 			{:else}
-				<button class="btn-primary py-2.5 text-[15px]" onclick={onStart}>
+				<button class="btn-primary py-2.5 text-[15px]" onclick={() => onStart()}>
 					{#if agent.status === 'error' || agent.status === 'ended'}
 						<RefreshCw class="size-4" /> {hasIncident ? 'Resume by voice' : 'Try again'}
 					{:else}
@@ -318,6 +321,25 @@
 		</div>
 	</div>
 
+	{#if agent.needsConsent}
+		<div
+			class="flex flex-col gap-3 border-b border-voice/30 bg-voice/5 px-4 py-3 text-[13px]"
+			role="dialog"
+			aria-labelledby="consent-title"
+		>
+			<p id="consent-title" class="font-semibold text-ink-100">Before voice starts</p>
+			<p class="text-ink-300">
+				Voice sessions are recorded and transcribed by AssemblyAI on SENTINEL's behalf. Transcripts
+				become part of the incident record and are kept under your organisation's retention policy.
+				Tell anyone else who may be heard.
+			</p>
+			<div class="flex flex-wrap gap-2">
+				<button class="btn-primary" onclick={() => onStart(true)}>I agree, start voice</button>
+				<button class="btn-ghost" onclick={() => (agent.needsConsent = false)}>Not now</button>
+			</div>
+		</div>
+	{/if}
+
 	{#if agent.status === 'error'}
 		<div
 			class="flex items-start gap-3 border-b border-crit/30 bg-crit/5 px-4 py-3 text-[12.5px]"
@@ -334,7 +356,7 @@
 				</p>
 			</div>
 			{#if voiceConfigured && !incidentClosed && agent.errorKind !== 'unsupported' && agent.errorKind !== 'insecure'}
-				<button class="btn-secondary shrink-0 text-xs" onclick={onStart}
+				<button class="btn-secondary shrink-0 text-xs" onclick={() => onStart()}
 					><RefreshCw class="size-3.5" /> Try again</button
 				>
 			{/if}

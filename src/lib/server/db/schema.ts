@@ -1,6 +1,7 @@
 import {
 	boolean,
 	check,
+	customType,
 	doublePrecision,
 	index,
 	integer,
@@ -25,9 +26,13 @@ import {
 	INCIDENT_TYPES,
 	INFO_PRIORITIES,
 	INFO_STATUSES,
+	NOTIFICATION_CHANNELS,
+	NOTIFICATION_STATES,
 	SEVERITIES,
-	SOURCE_TYPES
+	SOURCE_TYPES,
+	USER_ROLES
 } from '../../domain/types';
+import { decrypt, encrypt } from './crypto';
 
 /** CHECK (col IN (...)) — enforces domain enums at the database layer too. */
 const oneOf = (col: SQL | import('drizzle-orm/pg-core').AnyPgColumn, values: readonly string[]) =>
@@ -40,10 +45,101 @@ const id = () =>
 const ts = (name: string) => timestamp(name, { withTimezone: true, mode: 'date' });
 const createdAt = () => ts('created_at').notNull().defaultNow();
 
+/** Text encrypted at rest when DATA_ENCRYPTION_KEY is set (transparent through the ORM). */
+const encryptedText = customType<{ data: string; driverData: string }>({
+	dataType: () => 'text',
+	toDriver: (v) => encrypt(v),
+	fromDriver: (v) => decrypt(v)
+});
+
+// ─── Identity & tenancy ──────────────────────────────────────────────────────
+
+export const organizations = pgTable('organizations', {
+	id: id(),
+	name: text('name').notNull(),
+	slug: text('slug').notNull().unique(),
+	/** Demo orgs get compressed timers and simulated external actors. */
+	isDemo: boolean('is_demo').notNull().default(false),
+	/** Operational policy: response timeout, escalation chain, retention, voice caps. */
+	settings: jsonb('settings').$type<Record<string, unknown>>().notNull().default({}),
+	createdAt: createdAt()
+});
+
+export const users = pgTable(
+	'users',
+	{
+		id: id(),
+		email: text('email').notNull(),
+		name: text('name').notNull(),
+		passwordHash: text('password_hash'),
+		/** Set when the user accepted the recording/transcription notice. */
+		voiceConsentAt: ts('voice_consent_at'),
+		disabledAt: ts('disabled_at'),
+		createdAt: createdAt()
+	},
+	(t) => [uniqueIndex('users_email_uq').on(sql`lower(${t.email})`)]
+);
+
+export const memberships = pgTable(
+	'memberships',
+	{
+		id: id(),
+		userId: text('user_id')
+			.notNull()
+			.references(() => users.id, { onDelete: 'cascade' }),
+		orgId: text('org_id')
+			.notNull()
+			.references(() => organizations.id, { onDelete: 'cascade' }),
+		role: text('role').notNull(),
+		createdAt: createdAt()
+	},
+	(t) => [
+		uniqueIndex('memberships_user_org_uq').on(t.userId, t.orgId),
+		check('memberships_role_ck', oneOf(t.role, USER_ROLES))
+	]
+);
+
+export const authSessions = pgTable(
+	'auth_sessions',
+	{
+		/** sha256 of the cookie token; the token itself is never stored. */
+		id: text('id').primaryKey(),
+		userId: text('user_id')
+			.notNull()
+			.references(() => users.id, { onDelete: 'cascade' }),
+		orgId: text('org_id')
+			.notNull()
+			.references(() => organizations.id, { onDelete: 'cascade' }),
+		expiresAt: ts('expires_at').notNull(),
+		createdAt: createdAt()
+	},
+	(t) => [index('auth_sessions_user_idx').on(t.userId)]
+);
+
+/** Machine credentials (sensors, integrations). Stored hashed; shown once. */
+export const apiKeys = pgTable('api_keys', {
+	id: id(),
+	orgId: text('org_id')
+		.notNull()
+		.references(() => organizations.id, { onDelete: 'cascade' }),
+	name: text('name').notNull(),
+	keyHash: text('key_hash').notNull().unique(),
+	prefix: text('prefix').notNull(),
+	createdBy: text('created_by'),
+	lastUsedAt: ts('last_used_at'),
+	revokedAt: ts('revoked_at'),
+	createdAt: createdAt()
+});
+
+// ─── Incidents ───────────────────────────────────────────────────────────────
+
 export const incidents = pgTable(
 	'incidents',
 	{
 		id: id(),
+		orgId: text('org_id')
+			.notNull()
+			.references(() => organizations.id, { onDelete: 'cascade' }),
 		code: text('code').notNull(),
 		title: text('title').notNull(),
 		type: text('type').notNull(),
@@ -65,7 +161,8 @@ export const incidents = pgTable(
 		updatedAt: ts('updated_at').notNull().defaultNow()
 	},
 	(t) => [
-		uniqueIndex('incidents_code_uq').on(t.code),
+		uniqueIndex('incidents_org_code_uq').on(t.orgId, t.code),
+		index('incidents_org_idx').on(t.orgId, t.reportedAt),
 		index('incidents_created_idx').on(t.createdAt),
 		check('incidents_status_ck', oneOf(t.status, INCIDENT_STATUSES)),
 		check('incidents_type_ck', oneOf(t.type, INCIDENT_TYPES)),
@@ -79,6 +176,12 @@ export const incidents = pgTable(
 
 export const voiceSessions = pgTable('voice_sessions', {
 	id: id(),
+	orgId: text('org_id')
+		.notNull()
+		.references(() => organizations.id, { onDelete: 'cascade' }),
+	/** The person speaking on this session (attribution for multi-reporter incidents). */
+	userId: text('user_id').references(() => users.id, { onDelete: 'set null' }),
+	consentAt: ts('consent_at'),
 	incidentId: text('incident_id').references(() => incidents.id, { onDelete: 'set null' }),
 	providerSessionId: text('provider_session_id'),
 	status: text('status').notNull().default('connecting'),
@@ -90,6 +193,10 @@ export const voiceSessions = pgTable('voice_sessions', {
 	endReason: text('end_reason'),
 	reconnects: integer('reconnects').notNull().default(0),
 	errorCount: integer('error_count').notNull().default(0),
+	/** Post-session cross-check against AssemblyAI's own session record. */
+	reconciledAt: ts('reconciled_at'),
+	reconciliation: jsonb('reconciliation').$type<Record<string, unknown>>(),
+	providerDeletedAt: ts('provider_deleted_at'),
 	createdAt: createdAt()
 });
 
@@ -102,7 +209,11 @@ export const transcripts = pgTable(
 		}),
 		incidentId: text('incident_id').references(() => incidents.id, { onDelete: 'cascade' }),
 		speaker: text('speaker').notNull(),
-		text: text('text').notNull(),
+		userId: text('user_id'),
+		text: encryptedText('text').notNull(),
+		/** STT confidence from AssemblyAI's session record (filled by reconciliation). */
+		sttConfidence: doublePrecision('stt_confidence'),
+		redactedAt: ts('redacted_at'),
 		channel: text('channel').notNull().default('voice'),
 		providerItemId: text('provider_item_id'),
 		interrupted: boolean('interrupted').notNull().default(false),
@@ -137,9 +248,11 @@ export const facts = pgTable(
 		supersededById: text('superseded_by_id'),
 		sourceType: text('source_type').notNull(),
 		transcriptId: text('transcript_id').references(() => transcripts.id, { onDelete: 'set null' }),
-		evidenceQuote: text('evidence_quote'),
+		evidenceQuote: encryptedText('evidence_quote'),
 		quoteMatched: boolean('quote_matched'),
 		speaker: text('speaker'),
+		/** Sensor / device id for observed facts. */
+		sourceRef: text('source_ref'),
 		observedAt: ts('observed_at').notNull().defaultNow(),
 		confirmedAt: ts('confirmed_at'),
 		confirmationNote: text('confirmation_note'),
@@ -271,9 +384,16 @@ export const timelineEvents = pgTable(
 		refType: text('ref_type'),
 		refId: text('ref_id'),
 		metadata: jsonb('metadata').$type<Record<string, unknown>>(),
-		occurredAt: ts('occurred_at').notNull().defaultNow()
+		occurredAt: ts('occurred_at').notNull().defaultNow(),
+		/** Tamper evidence: per-incident sequence and SHA-256 hash chain. */
+		chainSeq: integer('chain_seq').notNull().default(0),
+		prevHash: text('prev_hash'),
+		hash: text('hash')
 	},
-	(t) => [index('timeline_incident_idx').on(t.incidentId, t.occurredAt)]
+	(t) => [
+		index('timeline_incident_idx').on(t.incidentId, t.occurredAt),
+		uniqueIndex('timeline_chain_uq').on(t.incidentId, t.chainSeq)
+	]
 );
 
 /** Audit log of every tool execution, successful or not. */
@@ -283,6 +403,7 @@ export const toolInvocations = pgTable(
 		id: id(),
 		voiceSessionId: text('voice_session_id'),
 		incidentId: text('incident_id'),
+		userId: text('user_id'),
 		callId: text('call_id'),
 		toolName: text('tool_name').notNull(),
 		origin: text('origin').notNull(),
@@ -314,6 +435,9 @@ export const reports = pgTable(
 
 export const contacts = pgTable('contacts', {
 	id: id(),
+	orgId: text('org_id')
+		.notNull()
+		.references(() => organizations.id, { onDelete: 'cascade' }),
 	name: text('name').notNull(),
 	role: text('role').notNull(),
 	roleLabel: text('role_label').notNull(),
@@ -321,5 +445,72 @@ export const contacts = pgTable('contacts', {
 	organization: text('organization').notNull(),
 	isDemo: boolean('is_demo').notNull().default(true),
 	notificationChannel: text('notification_channel').notNull().default('none'),
+	phone: text('phone'),
+	email: text('email'),
+	/** On-call contacts are preferred when resolving an escalation target. */
+	onCall: boolean('on_call').notNull().default(false),
 	createdAt: createdAt()
+});
+
+// ─── Notifications, attachments, shared rate limiting ────────────────────────
+
+export const notifications = pgTable(
+	'notifications',
+	{
+		id: id(),
+		orgId: text('org_id')
+			.notNull()
+			.references(() => organizations.id, { onDelete: 'cascade' }),
+		incidentId: text('incident_id').references(() => incidents.id, { onDelete: 'cascade' }),
+		escalationId: text('escalation_id'),
+		actionId: text('action_id'),
+		contactId: text('contact_id'),
+		channel: text('channel').notNull(),
+		toAddress: text('to_address'),
+		body: text('body').notNull(),
+		status: text('status').notNull(),
+		providerMessageId: text('provider_message_id'),
+		error: text('error'),
+		/** sha256 of the one-time acknowledgement token sent in the message. */
+		ackTokenHash: text('ack_token_hash'),
+		acknowledgedAt: ts('acknowledged_at'),
+		createdAt: createdAt(),
+		updatedAt: ts('updated_at').notNull().defaultNow()
+	},
+	(t) => [
+		index('notifications_incident_idx').on(t.incidentId),
+		index('notifications_provider_idx').on(t.providerMessageId),
+		check('notifications_channel_ck', oneOf(t.channel, NOTIFICATION_CHANNELS)),
+		check('notifications_status_ck', oneOf(t.status, NOTIFICATION_STATES))
+	]
+);
+
+export const attachments = pgTable(
+	'attachments',
+	{
+		id: id(),
+		orgId: text('org_id')
+			.notNull()
+			.references(() => organizations.id, { onDelete: 'cascade' }),
+		incidentId: text('incident_id')
+			.notNull()
+			.references(() => incidents.id, { onDelete: 'cascade' }),
+		kind: text('kind').notNull().default('photo'),
+		mime: text('mime').notNull(),
+		sizeBytes: integer('size_bytes').notNull(),
+		sha256: text('sha256').notNull(),
+		/** Base64 payload, kept in Postgres for zero-infrastructure deploys (≤ 5 MB). */
+		data: text('data').notNull(),
+		caption: text('caption'),
+		uploadedBy: text('uploaded_by'),
+		createdAt: createdAt()
+	},
+	(t) => [index('attachments_incident_idx').on(t.incidentId)]
+);
+
+/** Fixed-window counters shared by every app instance. */
+export const rateLimits = pgTable('rate_limits', {
+	key: text('key').primaryKey(),
+	windowStart: ts('window_start').notNull(),
+	count: integer('count').notNull()
 });

@@ -2,6 +2,7 @@
 	import { BellRing, FlaskConical, ListChecks, MessageSquareReply, Plus } from '@lucide/svelte';
 	import { ACTION_TRANSITIONS } from '$lib/domain/state-machine';
 	import { ACTION_TONE } from '$lib/components/ui/tones';
+	import NotificationBadge from './NotificationBadge.svelte';
 	import type { ActionStatus } from '$lib/domain/types';
 	import type { ActionView, IncidentView } from '$lib/domain/view';
 	import { fmtClock, fmtCountdown } from '$lib/utils/format';
@@ -130,15 +131,7 @@
 							</span>
 							{#if a.priority === 'immediate'}<span class="text-high">immediate</span>{/if}
 							{#if a.contactName}<span>contact: {a.contactName}</span>{/if}
-							{#if a.notificationStatus === 'simulated'}
-								<span class="text-voice">demo simulation</span>
-							{:else if a.notificationStatus === 'not_configured'}
-								<span
-									class="text-ink-500"
-									title="SENTINEL has no messaging integration; staff contact them directly"
-									>not auto-notified</span
-								>
-							{/if}
+							<NotificationBadge status={a.notificationStatus} />
 						</p>
 						{#if awaiting(a)}
 							<div class="mt-1.5">
@@ -332,9 +325,7 @@
 								>
 								<span class="text-ink-500">no real message sent</span>
 							{:else}
-								<span class="text-ink-500"
-									>No notification channel configured, so staff contact them directly</span
-								>
+								<NotificationBadge status={e.notificationStatus} />
 							{/if}
 							<span class="ml-auto mono text-ink-500">{fmtClock(e.createdAt)}</span>
 						</p>
@@ -382,8 +373,8 @@
 			</p>
 			<p class="mb-2 text-[11.5px] text-ink-400">
 				Stands in for people outside the call. Everything done here is labelled as simulated. With
-				no input, a contact that doesn't reply escalates after 30 s (a real deployment would use 15
-				min).
+				no input, a contact that doesn't reply escalates after 30 s (real organisations set their
+				own timeout in Settings).
 			</p>
 			<div class="flex flex-wrap gap-2">
 				<button

@@ -4,6 +4,7 @@
 	import { page } from '$app/state';
 	import { CircleAlert, FileText, FlaskConical, LoaderCircle, WifiOff } from '@lucide/svelte';
 	import Brand from './Brand.svelte';
+	import UserMenu from '$lib/components/ui/UserMenu.svelte';
 	import ManualCreate from './ManualCreate.svelte';
 	import IncidentSummary from '$lib/components/incident/IncidentSummary.svelte';
 	import SeverityBadge from '$lib/components/incident/SeverityBadge.svelte';
@@ -14,6 +15,8 @@
 	import OperationalState from '$lib/components/incident/OperationalState.svelte';
 	import ActionPanel from '$lib/components/actions/ActionPanel.svelte';
 	import TimelinePanel from '$lib/components/timeline/TimelinePanel.svelte';
+	import PhotoEvidence from '$lib/components/evidence/PhotoEvidence.svelte';
+	import OutreachLog from '$lib/components/actions/OutreachLog.svelte';
 	import { VoiceAgent } from '$lib/voice/agent.svelte';
 	import { getScenario } from '$lib/demo/scenarios';
 	import { INCIDENT_TRANSITIONS } from '$lib/domain/state-machine';
@@ -35,7 +38,6 @@
 	let highlightText = $state<string | null>(null);
 	let toast = $state<{ text: string; tone: 'ok' | 'error' | 'info' } | null>(null);
 	let loadError = $state<string | null>(null);
-	let checking = false;
 	let refreshSeq = 0;
 
 	const placeholders = [
@@ -61,9 +63,18 @@
 	const status = $derived(view?.incident.status ?? null);
 	const finished = $derived(status === 'closed');
 	const isDemo = $derived(view?.incident.isDemo ?? !!scenario);
+	const role = $derived(page.data.user?.role ?? 'reporter');
+	const canExport = $derived(role === 'manager' || role === 'admin');
 	const nextStatuses = $derived(
 		status ? INCIDENT_TRANSITIONS[status].filter((s) => s !== 'closed') : []
 	);
+
+	// Escalations, delivery receipts, acknowledgements and sensor readings reach
+	// a live session from the server; show them and refresh the record.
+	agent.onSystemEvent = (text) => {
+		flash(text, /escalat|not delivered|failed/i.test(text) ? 'error' : 'info');
+		void refresh();
+	};
 
 	agent.onIncidentChanged = (id) => {
 		if (!id) return;
@@ -113,7 +124,6 @@
 			}
 			flash(body.message ?? 'Saved', 'ok');
 			await refresh(body.incidentId ?? incidentId);
-			agent.refreshContext();
 			return true;
 		} catch {
 			flash('Server unreachable — nothing was saved.', 'error');
@@ -134,46 +144,15 @@
 			return;
 		}
 		await refresh();
-		const latest = view?.timeline.at(-1)?.description ?? body.message;
-		flash(`Demo simulation: ${latest}`, 'info');
-		if (agent.active) agent.notifySystemEvent(`${latest}`);
+		// A live voice session hears about it from the server (voice bus).
+		if (!agent.active)
+			flash(`Demo simulation: ${view?.timeline.at(-1)?.description ?? body.message}`, 'info');
 	}
 
-	/** Response-timeout rule: ask the server to evaluate once something is due. */
-	async function checkEscalations() {
-		if (!incidentId || !view || checking) return;
-		const due = view.actions.some(
-			(a) =>
-				a.requiresResponse &&
-				a.status === 'in_progress' &&
-				!a.responseReceivedAt &&
-				a.responseDueAt &&
-				new Date(a.responseDueAt).getTime() <= Date.now()
-		);
-		if (!due) return;
-		checking = true;
-		try {
-			const res = await fetch(`/api/incidents/${incidentId}/escalation-check`, { method: 'POST' });
-			const body = (await res.json()) as {
-				created?: { target: string; reason: string; simulated: boolean }[];
-			};
-			await refresh();
-			for (const c of body.created ?? []) {
-				const text = `${c.reason}. Escalated to ${c.target}${c.simulated ? ' (demo simulation, no real message sent)' : ' (no notification channel is configured, so someone must contact them directly)'}.`;
-				flash(text, 'error');
-				if (agent.active) agent.notifySystemEvent(text);
-			}
-		} finally {
-			checking = false;
-		}
-	}
-
-	// Clock + rule evaluation tick.
+	// Clock for countdowns. Escalation timers run on the server (scheduler), so
+	// they fire even when nobody has this page open.
 	$effect(() => {
-		const tick = setInterval(() => {
-			now = Date.now();
-			void checkEscalations();
-		}, 1000);
+		const tick = setInterval(() => (now = Date.now()), 1000);
 		return () => clearInterval(tick);
 	});
 
@@ -188,8 +167,8 @@
 	// Leaving the page ends the voice session cleanly (session.end stops billing).
 	$effect(() => () => void agent.end());
 
-	function startVoice() {
-		void agent.start({ incidentId: view?.incident.id ?? null, scenario: scenarioId });
+	function startVoice(consent?: boolean) {
+		void agent.start({ incidentId: view?.incident.id ?? null, scenario: scenarioId, consent });
 	}
 
 	async function changeStatus(e: Event & { currentTarget: HTMLSelectElement }) {
@@ -239,7 +218,7 @@
 				{/if}
 			</div>
 			{#if view}
-				<div class="flex items-center gap-2">
+				<div class="flex flex-wrap items-center gap-2">
 					{#if !finished}
 						<select
 							class="rounded-md border border-ink-600 bg-ink-800 py-1 pr-7 pl-2 text-xs text-ink-200 focus:border-voice focus:ring-0"
@@ -269,8 +248,17 @@
 						class="btn-ghost text-xs"
 						href={resolve('/incidents/[id]/replay', { id: view.incident.id })}>Replay</a
 					>
+					{#if canExport}
+						<a
+							class="btn-ghost text-xs"
+							href={resolve('/api/incidents/[id]/export', { id: view.incident.id })}
+							download
+							data-sveltekit-reload>Export</a
+						>
+					{/if}
 				</div>
 			{/if}
+			<UserMenu />
 		</div>
 		{#if agent.status === 'reconnecting'}
 			<div
@@ -366,6 +354,19 @@
 					readOnly={finished}
 					onSelectFact={(id) => (selectedFactId = id)}
 				/>
+			</section>
+			<section class="xl:col-span-7">
+				<PhotoEvidence
+					{view}
+					readOnly={finished}
+					onUploaded={(text, ok) => {
+						flash(text, ok ? 'ok' : 'error');
+						if (ok) void refresh();
+					}}
+				/>
+			</section>
+			<section class="xl:col-span-5">
+				<OutreachLog {view} />
 			</section>
 			<section class="xl:col-span-12">
 				<TimelinePanel {view} {runTool} readOnly={finished} />

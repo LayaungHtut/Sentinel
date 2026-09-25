@@ -1,0 +1,42 @@
+name: Nightly live voice evaluation
+
+# Runs the scripted voice scenarios against the real AssemblyAI Voice Agent API.
+# Requires the repository secret ASSEMBLYAI_API_KEY (billed usage: roughly
+# 10–15 minutes of voice-agent time per run). Skipped when the secret is absent.
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-voice:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ASSEMBLYAI_API_KEY: ${{ secrets.ASSEMBLYAI_API_KEY }}
+    steps:
+      - if: env.ASSEMBLYAI_API_KEY == ''
+        run: echo "ASSEMBLYAI_API_KEY secret not set; skipping." && exit 0
+      - uses: actions/checkout@v4
+        if: env.ASSEMBLYAI_API_KEY != ''
+      - uses: actions/setup-node@v4
+        if: env.ASSEMBLYAI_API_KEY != ''
+        with:
+          node-version: 22
+          cache: npm
+      - if: env.ASSEMBLYAI_API_KEY != ''
+        # Synthesised speech for scenarios without recorded audio.
+        run: sudo apt-get update && sudo apt-get install -y espeak-ng sox
+      - if: env.ASSEMBLYAI_API_KEY != ''
+        run: npm ci && npm run build
+      - if: env.ASSEMBLYAI_API_KEY != ''
+        run: node scripts/live-voice.mjs --min-pass-rate=0.8
+      - if: always() && env.ASSEMBLYAI_API_KEY != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice-eval-results
+          path: .data/voice-results/
+          if-no-files-found: ignore

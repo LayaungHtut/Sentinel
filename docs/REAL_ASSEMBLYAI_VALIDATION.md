@@ -88,3 +88,20 @@ Divergences found live:
 - A user-role `conversation.message` is not seen by the agent, so SENTINEL carries typed input in `reply.create` instructions.
 - `session.resume` is rejected.
 - A token was accepted twice.
+
+## 2026-09-25: production architecture (server-side relay)
+
+The voice path changed: browsers now talk only to SENTINEL's relay, and the **server** holds the AssemblyAI WebSocket (`Authorization: Bearer`, no browser tokens). The server stores transcripts, executes tools, and runs escalation timers in its scheduler. Everything was re-validated live on this architecture. The key was checked for presence only and never printed. `scripts/live-browser.mjs` asserts that the browser made no request to any AssemblyAI host and that no URL contained the key.
+
+| Batch                                       | Runs   | Passed | Notes                                                                                                                                                                                                                                                |
+| ------------------------------------------- | ------ | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| basic-incident, correction                  | 2      | 2      | First runs through the relay                                                                                                                                                                                                                         |
+| escalation (before fix)                     | 1      | 0      | The server timer fired on time (30 s), but the agent called `create_escalation` again and didn't announce it → duplicate-escalation guidance + "SYSTEM EVENT is already recorded" rule                                                               |
+| escalation (after fix)                      | 1      | 1      | "Ko Min hasn't responded, so I've escalated this to Maya Win. This is a simulated outreach."                                                                                                                                                         |
+| Full suite (8 scripted scenarios)           | 8      | 7      | `ambiguous-temperature` failed: the model sent an invented fact `category` twice and `create_incident` was rejected → argument repair drops invalid categories (unit-tested)                                                                         |
+| ambiguous-temperature (after fix)           | 2      | 2      |                                                                                                                                                                                                                                                      |
+| **Scenario total**                          | **14** | **12** |                                                                                                                                                                                                                                                      |
+| Real browser (`live-browser.mjs`)           | 3      | 1      | Both failures were harness defects: Playwright emits no frame events for routed sockets, and one selector was ambiguous. The last run passed 10/10, including a real browser↔relay drop recovered with a new AssemblyAI session on the same incident |
+| `session.resume` probe (server-side Bearer) | 3      | 0      | `session_not_found` after 1 s, 5 s and 15 s. The failure is independent of auth method. Draft report: [ASSEMBLYAI_SUPPORT_REPORT.md](ASSEMBLYAI_SUPPORT_REPORT.md)                                                                                   |
+
+Not validated live: real notification providers (Twilio, SMTP, Slack) need production credentials. The generic webhook path, including HMAC signature and acknowledgement link, is exercised end-to-end in `npm run test:e2e`.

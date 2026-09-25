@@ -15,6 +15,13 @@
       "when": 1790249744504,
       "tag": "0001_evidence_links",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790269096844,
+      "tag": "0002_production_hardening",
+      "breakpoints": true
     }
   ]
 }

@@ -2,6 +2,7 @@ import { and, asc, eq, inArray, or } from 'drizzle-orm';
 import * as t from '../db/schema';
 import {
 	addTimeline,
+	getOrgSettings,
 	getIncident,
 	loadSnapshot,
 	mapFact,
@@ -26,7 +27,8 @@ import {
 import { getPlaybook } from '$lib/domain/playbooks';
 import { assessSeverity } from '$lib/domain/severity';
 import { buildChecklist, nextQuestions } from '$lib/domain/information';
-import { evaluateResponseTimeouts, isAwaitingResponse } from '$lib/domain/escalation';
+import { evaluateResponseTimeouts, findContact, isAwaitingResponse } from '$lib/domain/escalation';
+import { queueNotification } from '../notifications/outbox';
 import type {
 	FactCategory,
 	FactRecord,
@@ -37,13 +39,18 @@ import type {
 	TimelineRecord
 } from '$lib/domain/types';
 
-export type Origin = 'voice' | 'operator' | 'demo_simulation' | 'system';
+/** external = a contact acting through an acknowledgement link; sensor = the observations API. */
+export type Origin = 'voice' | 'operator' | 'demo_simulation' | 'system' | 'external' | 'sensor';
 
 export interface EngineContext {
 	origin: Origin;
+	/** Display name of the person (or integration) acting; recorded on timeline events. */
+	actorName?: string | null;
 	voiceSessionId: string | null;
 	toolName?: string;
 	now: Date;
+	/** Sensor API: the device/reading identifier stored as the fact's source reference. */
+	sourceRef?: string | null;
 }
 
 export function timelineSource(origin: Origin): TimelineRecord['source'] {
@@ -54,6 +61,10 @@ export function timelineSource(origin: Origin): TimelineRecord['source'] {
 			return 'operator';
 		case 'demo_simulation':
 			return 'demo_simulation';
+		case 'external':
+			return 'external';
+		case 'sensor':
+			return 'sensor';
 		default:
 			return 'system';
 	}
@@ -78,6 +89,7 @@ export async function transitionIncident(
 		eventType: 'status_changed',
 		description: `Status ${incident.status.toUpperCase()} → ${to.toUpperCase()}: ${reason}`,
 		source: timelineSource(ctx.origin),
+		actor: ctx.actorName ?? null,
 		toolName: ctx.toolName,
 		metadata: { from: incident.status, to },
 		occurredAt: ctx.now
@@ -193,8 +205,11 @@ export async function recordFacts(
 				channel = transcriptRows.find((r) => r.id === match.transcriptId)?.channel ?? null;
 			}
 		}
+		// Sensor readings are machine observations: their own basis and source, never "stated".
+		const basis = ctx.origin === 'sensor' ? 'observed' : input.basis;
 		let sourceType: SourceType;
-		if (input.basis === 'inferred') sourceType = 'agent_inference';
+		if (ctx.origin === 'sensor') sourceType = 'sensor';
+		else if (input.basis === 'inferred') sourceType = 'agent_inference';
 		else if (ctx.origin === 'operator') sourceType = 'operator_entry';
 		else if (ctx.origin === 'demo_simulation') sourceType = 'demo_simulation';
 		else if (channel === 'typed') sourceType = 'typed_message';
@@ -258,7 +273,7 @@ export async function recordFacts(
 				numericValue: candidate.numericValue,
 				unit: candidate.unit,
 				certainty: input.certainty,
-				basis: input.basis,
+				basis,
 				needsVerification: defaultNeedsVerification(category),
 				verification,
 				status: 'current',
@@ -267,12 +282,11 @@ export async function recordFacts(
 				transcriptId,
 				evidenceQuote: input.evidence_quote ?? null,
 				quoteMatched,
+				sourceRef: ctx.sourceRef ?? null,
 				speaker:
-					input.basis === 'stated'
-						? ctx.origin === 'operator'
-							? 'Operator'
-							: 'Reporter'
-						: 'SENTINEL',
+					input.basis === 'inferred'
+						? 'SENTINEL'
+						: (ctx.actorName ?? (ctx.origin === 'operator' ? 'Operator' : 'Reporter')),
 				observedAt: ctx.now,
 				confirmedAt: verification === 'confirmed' ? ctx.now : null,
 				confirmationNote: input.confirmationNote ?? null
@@ -289,6 +303,7 @@ export async function recordFacts(
 				? `${label} updated: ${formatFactValue(existing)} → ${display} (${EPISTEMIC_LABELS[cls].toUpperCase()})`
 				: `${label} recorded: ${display} (${EPISTEMIC_LABELS[cls].toUpperCase()})`,
 			source: timelineSource(ctx.origin),
+			actor: ctx.actorName ?? null,
 			toolName: ctx.toolName,
 			refType: 'fact',
 			refId: fact.id,
@@ -303,7 +318,7 @@ export async function recordFacts(
 			.where(and(eq(t.infoRequests.incidentId, incident.id), eq(t.infoRequests.key, key)));
 
 		// Facts drive incident header fields, so the header always has provenance.
-		if (key === 'location' && input.basis === 'stated') {
+		if (key === 'location' && basis === 'stated') {
 			await touchIncident(db, incident.id, { location: value });
 			incident.location = value;
 		}
@@ -337,9 +352,16 @@ export async function runEscalationCheck(db: Tx, incidentId: string, ctx: Engine
 		snap.actions,
 		snap.escalations,
 		snap.contacts,
-		ctx.now
+		ctx.now,
+		(await getOrgSettings(db, snap.incident.orgId)).escalationChain
 	);
-	const created: { seq: number; target: string; reason: string; simulated: boolean }[] = [];
+	const created: {
+		seq: number;
+		target: string;
+		reason: string;
+		simulated: boolean;
+		statement: string;
+	}[] = [];
 	let seq = snap.escalations.reduce((m, e) => Math.max(m, e.seq), 0);
 	for (const d of due) {
 		seq += 1;
@@ -356,7 +378,7 @@ export async function runEscalationCheck(db: Tx, incidentId: string, ctx: Engine
 				trigger: 'response_timeout',
 				status: 'open',
 				simulated: snap.incident.isDemo,
-				notificationStatus: snap.incident.isDemo ? 'simulated' : 'not_configured',
+				notificationStatus: 'queued',
 				createdAt: ctx.now
 			})
 			.onConflictDoNothing()
@@ -369,17 +391,37 @@ export async function runEscalationCheck(db: Tx, incidentId: string, ctx: Engine
 			.update(t.actions)
 			.set({ status: 'escalated', updatedAt: ctx.now })
 			.where(eq(t.actions.id, d.action.id));
+		const q = await queueNotification(db, {
+			incident: snap.incident,
+			contact: d.target.role
+				? findContact(d.target.role, snap.incident.location, snap.contacts)
+				: null,
+			contactName: d.target.name,
+			purpose: 'escalation',
+			text: `${snap.incident.title}${snap.incident.location ? ` at ${snap.incident.location}` : ''}. ${d.reason}.`,
+			escalationId: inserted[0].id
+		});
+		await db
+			.update(t.escalations)
+			.set({ notificationStatus: q.status })
+			.where(eq(t.escalations.id, inserted[0].id));
 		await addTimeline(db, {
 			incidentId,
 			eventType: 'escalation_created',
-			description: `${d.reason} — escalated to ${d.target.name}${snap.incident.isDemo ? ' (DEMO SIMULATION — no real message sent)' : ' (no notification channel configured)'}`,
+			description: `${d.reason} — escalated to ${d.target.name}. ${q.statement}`,
 			source: snap.incident.isDemo ? 'demo_simulation' : 'system',
 			refType: 'escalation',
 			refId: inserted[0].id,
 			metadata: { rule: 'response_timeout', actionSeq: d.action.seq },
 			occurredAt: ctx.now
 		});
-		created.push({ seq, target: d.target.name, reason: d.reason, simulated: snap.incident.isDemo });
+		created.push({
+			seq,
+			target: d.target.name,
+			reason: d.reason,
+			simulated: snap.incident.isDemo,
+			statement: q.statement
+		});
 	}
 	if (created.length) {
 		await applyAutoProgression(db, incidentId, 'escalation_opened', ctx);
