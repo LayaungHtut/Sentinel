@@ -4,16 +4,17 @@ import type { PgDatabase, PgQueryResultHKT } from 'drizzle-orm/pg-core';
 import * as schema from './schema';
 
 /**
- * One Drizzle database, two PostgreSQL drivers:
- *  - DATABASE_URL set → node-postgres against a real server (Neon, Supabase, Docker, …)
- *  - otherwise        → PGlite, an embedded PostgreSQL (WASM) persisted to .data/pglite
- * Both speak the same SQL and run the same migrations.
+ * One Drizzle database, three PostgreSQL drivers:
+ *  - DATABASE_URL set    → node-postgres against a real server (Neon, Supabase, Docker, …)
+ *  - on Netlify          → Netlify Database (migrations are applied by the platform at deploy)
+ *  - otherwise           → PGlite, an embedded PostgreSQL (WASM) persisted to .data/pglite
+ * All speak the same SQL and run the same migrations.
  */
 export type Database = PgDatabase<PgQueryResultHKT, typeof schema>;
 
 export interface DbHandle {
 	db: Database;
-	driver: 'postgres' | 'pglite';
+	driver: 'postgres' | 'netlify' | 'pglite';
 	close: () => Promise<void>;
 }
 
@@ -27,8 +28,27 @@ export function migrationsFolder(): string {
 	return candidates.find((p) => existsSync(p)) ?? candidates[0];
 }
 
+/**
+ * Netlify Database: the platform applies netlify/database/migrations before each deploy
+ * is published, so no runtime migration happens here.
+ */
+async function createNetlifyDb(): Promise<DbHandle> {
+	const { getDatabase } = await import('@netlify/database');
+	const conn = getDatabase();
+	if (conn.driver === 'serverless') {
+		const { drizzle } = await import('drizzle-orm/neon-serverless');
+		const db = drizzle(conn.pool, { schema });
+		return { db: db as unknown as Database, driver: 'netlify', close: () => conn.pool.end() };
+	}
+	const { drizzle } = await import('drizzle-orm/node-postgres');
+	const db = drizzle(conn.pool, { schema });
+	return { db: db as unknown as Database, driver: 'netlify', close: () => conn.pool.end() };
+}
+
 export async function createDb(options: {
 	databaseUrl?: string;
+	/** Use Netlify Database (ignored when databaseUrl is set). */
+	netlify?: boolean;
 	pgliteDataDir?: string;
 	migrate?: boolean;
 	/** node-postgres pool size (default 10, or PG_POOL_MAX). */
@@ -49,6 +69,7 @@ export async function createDb(options: {
 		}
 		return { db: db as unknown as Database, driver: 'postgres', close: () => pool.end() };
 	}
+	if (options.netlify) return createNetlifyDb();
 	const { PGlite } = await import('@electric-sql/pglite');
 	const { drizzle } = await import('drizzle-orm/pglite');
 	const dataDir = options.pgliteDataDir ?? '.data/pglite';
@@ -67,6 +88,7 @@ export function getDbHandle(): Promise<DbHandle> {
 	if (!handlePromise) {
 		handlePromise = createDb({
 			databaseUrl: process.env.DATABASE_URL || undefined,
+			netlify: !!process.env.NETLIFY_DB_URL,
 			pgliteDataDir: process.env.PGLITE_DATA_DIR || undefined
 		}).catch((err) => {
 			handlePromise = null;
